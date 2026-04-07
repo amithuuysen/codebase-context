@@ -91,8 +91,8 @@ class Config:
     ollama_host: str = "http://127.0.0.1:11434"
     ollama_model: str = "nomic-embed-text"
     local_model: str = "all-MiniLM-L6-v2"
-    chunk_size: int = 2500
-    chunk_overlap: int = 300
+    chunk_size: int = 1500
+    chunk_overlap: int = 200
     embedding_batch_size: int = 100
     chunk_limit: int = 450_000
     sync_interval_seconds: int = 300
@@ -108,8 +108,8 @@ class Config:
             ollama_host=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"),
             ollama_model=os.getenv("OLLAMA_MODEL", "nomic-embed-text"),
             local_model=os.getenv("LOCAL_EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
-            chunk_size=int(os.getenv("CHUNK_SIZE", "2500")),
-            chunk_overlap=int(os.getenv("CHUNK_OVERLAP", "300")),
+            chunk_size=int(os.getenv("CHUNK_SIZE", "1500")),
+            chunk_overlap=int(os.getenv("CHUNK_OVERLAP", "200")),
             embedding_batch_size=int(os.getenv("EMBEDDING_BATCH_SIZE", "100")),
             chunk_limit=int(os.getenv("CHUNK_LIMIT", "450000")),
             sync_interval_seconds=int(os.getenv("SYNC_INTERVAL_SECONDS", "300")),

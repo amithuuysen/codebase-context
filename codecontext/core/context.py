@@ -455,7 +455,10 @@ class Context:
                 total_chunks += 1
 
                 if len(buffer) >= batch_size:
-                    self._flush_buffer(buffer, codebase_path, col_name)
+                    try:
+                        self._flush_buffer(buffer, codebase_path, col_name)
+                    except Exception as exc:
+                        logger.warning("Batch flush failed, skipping %d chunks: %s", len(buffer), exc)
                     buffer = []
 
                 if total_chunks >= chunk_limit:
@@ -470,7 +473,10 @@ class Context:
                 break
 
         if buffer:
-            self._flush_buffer(buffer, codebase_path, col_name)
+            try:
+                self._flush_buffer(buffer, codebase_path, col_name)
+            except Exception as exc:
+                logger.warning("Final batch flush failed, skipping %d chunks: %s", len(buffer), exc)
 
         return {
             "processed_files": processed,
@@ -485,13 +491,26 @@ class Context:
         nodes: list[TextNode] = []
         bm25 = self._bm25_indices.get(col_name)
 
+        # Truncate chunk text to stay within embedding model context limits.
+        # nomic-embed-text has a 2048 token context; ~4 chars/token for code
+        # gives a safe limit of ~8000 chars.  We cap at chunk_size as the max.
+        max_embed_chars = self._cfg.chunk_size
+
         for chunk in chunks:
+            text = chunk.content
+            if len(text) > max_embed_chars:
+                text = text[:max_embed_chars]
+                logger.debug(
+                    "Truncated chunk from %s (%d→%d chars)",
+                    chunk.file_path, len(chunk.content), max_embed_chars,
+                )
+
             rel = os.path.relpath(chunk.file_path, codebase_path) if chunk.file_path else ""
             ext = os.path.splitext(chunk.file_path)[1] if chunk.file_path else ""
-            node_id = _generate_id(rel, chunk.start_line, chunk.end_line, chunk.content)
+            node_id = _generate_id(rel, chunk.start_line, chunk.end_line, text)
 
             node = TextNode(
-                text=chunk.content,
+                text=text,
                 id_=node_id,
                 metadata={
                     "relative_path": rel,
@@ -516,14 +535,59 @@ class Context:
             if bm25:
                 bm25.add_document(
                     doc_id=node_id,
-                    content=chunk.content,
+                    content=text,
                     relative_path=rel,
                     start_line=chunk.start_line,
                     end_line=chunk.end_line,
                     language=chunk.language,
                 )
 
-        self.vector_db.insert_nodes(col_name, nodes)
+        self._insert_nodes_safe(col_name, nodes)
+
+    def _insert_nodes_safe(self, col_name: str, nodes: list[TextNode]) -> None:
+        """Insert nodes into FAISS, retrying individual nodes on context-length errors."""
+        try:
+            self.vector_db.insert_nodes(col_name, nodes)
+        except Exception as exc:
+            exc_str = str(exc).lower()
+            if "context length" in exc_str or "too long" in exc_str or "exceeds" in exc_str:
+                logger.warning(
+                    "Batch embedding failed (context length). "
+                    "Retrying %d nodes individually with truncation…", len(nodes),
+                )
+                for node in nodes:
+                    self._insert_single_node_safe(col_name, node)
+            else:
+                raise
+
+    def _insert_single_node_safe(self, col_name: str, node: TextNode) -> None:
+        """Insert a single node, progressively truncating on context-length errors."""
+        text = node.text
+        for attempt in range(4):  # try full, 75%, 50%, 25%
+            try:
+                self.vector_db.insert_nodes(col_name, [node])
+                return
+            except Exception as exc:
+                exc_str = str(exc).lower()
+                if "context length" in exc_str or "too long" in exc_str or "exceeds" in exc_str:
+                    # Truncate to smaller fraction
+                    fraction = [1.0, 0.75, 0.5, 0.25][min(attempt + 1, 3)]
+                    new_len = int(len(text) * fraction)
+                    node.text = text[:new_len]
+                    logger.debug(
+                        "Truncating node %s to %d chars (attempt %d)",
+                        node.metadata.get("relative_path", "?"), new_len, attempt + 1,
+                    )
+                else:
+                    logger.warning(
+                        "Skipping node %s: %s",
+                        node.metadata.get("relative_path", "?"), exc,
+                    )
+                    return
+        logger.warning(
+            "Skipping node %s after 4 truncation attempts",
+            node.metadata.get("relative_path", "?"),
+        )
 
     async def _load_ignore_patterns(self, codebase_path: str) -> None:
         # 1. Local ignore files (.gitignore, .contextignore)
