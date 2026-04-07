@@ -58,6 +58,7 @@ def create_embedding(provider: str, **kwargs) -> BaseEmbedding:
         embed_model = OllamaEmbedding(
             model_name=kwargs.get("model", "nomic-embed-text"),
             base_url=kwargs.get("host", "http://127.0.0.1:11434"),
+            embed_batch_size=100,
         )
         logger.info("Embedding: Ollama model=%s", kwargs.get("model"))
         return embed_model

@@ -32,8 +32,10 @@ from .types import (
     SemanticSearchResult,
 )
 from .bm25 import BM25Index
+from .embedding_cache import EmbeddingCache
 from .hybrid_search import HybridSearcher
 from .merkle import MerkleSynchronizer
+from .path_obfuscation import PathObfuscator
 from .reranker import Reranker
 from .splitter import AstSplitter, Splitter, TextSplitter
 from .sync import FileSynchronizer
@@ -81,12 +83,23 @@ class Context:
         # Optional cross-encoder reranker (Stage 2 precision)
         self._reranker = reranker or Reranker()
 
+        # Embedding cache — skip re-embedding unchanged chunks (Cursor-style)
+        self._embedding_cache = EmbeddingCache(
+            self._cfg.data_dir,
+            self._cfg.embedding_provider,
+            self._cfg.embedding_model,
+        )
+
+        # Path obfuscation — encrypt path segments for privacy (Cursor-style)
+        self._path_obfuscator = PathObfuscator(self._cfg.data_dir)
+
         logger.info(
             "Context initialized — %d extensions, %d ignore patterns, "
-            "reranker=%s",
+            "reranker=%s, embedding_cache=%d entries",
             len(self.supported_extensions),
             len(self.ignore_patterns),
             self._reranker.provider,
+            len(self._embedding_cache),
         )
 
     # ------------------------------------------------------------------
@@ -219,6 +232,9 @@ class Context:
             bm25_path = Path(self._cfg.data_dir) / "bm25_store" / f"{col}.json"
             bm25.save(bm25_path)
 
+        # Persist embedding cache
+        self._embedding_cache.save()
+
         logger.info(
             "Indexing complete: %d/%d files processed, %d skipped, %d chunks",
             result["processed_files"], result["total_files"],
@@ -338,6 +354,9 @@ class Context:
             bm25_path = Path(self._cfg.data_dir) / "bm25_store" / f"{col_name}.json"
             bm25.save(bm25_path)
 
+        # Persist embedding cache
+        self._embedding_cache.save()
+
         return {"added": len(added), "removed": len(removed), "modified": len(modified)}
 
     # ------------------------------------------------------------------
@@ -447,117 +466,188 @@ class Context:
         codebase_path: str,
         progress: ProgressCallback | None = None,
     ) -> dict[str, Any]:
+        """Process files with concurrent splitting + embedding pipeline.
+
+        Architecture (Cursor-inspired):
+          - Producer: thread pool reads + AST-splits files in parallel
+          - Consumer: embeds + inserts chunks into FAISS/BM25
+          - Pipeline: producer fills an asyncio.Queue, consumer drains it
+            concurrently — embedding batch N while splitting batch N+1
+        """
         batch_size = self._cfg.embedding_batch_size
         chunk_limit = self._cfg.chunk_limit
-        buffer: list[CodeChunk] = []
-        processed = 0
-        total_chunks = 0
-        limit_reached = False
         col_name = self.get_collection_name(codebase_path)
 
         total_files = len(file_paths)
-        skipped = 0
         logger.info("Starting indexing: %d files to process", total_files)
 
         loop = asyncio.get_event_loop()
 
-        # --- Parallel file reading + AST splitting via thread pool ---
+        # --- Thread pool for parallel file reading + AST splitting ---
         from concurrent.futures import ThreadPoolExecutor
-        max_workers = min(os.cpu_count() or 4, 8)
+        max_workers = min(os.cpu_count() or 4, 14)  # M4 Pro has 12-14 cores
         executor = ThreadPoolExecutor(max_workers=max_workers)
-        logger.info("Using %d workers for parallel file splitting", max_workers)
+        logger.info("Using %d workers for parallel file splitting (pipelined)", max_workers)
 
-        # Process files in parallel batches, pipeline with embedding
-        parallel_batch = max_workers * 4  # read+split this many files at once
+        # --- Async queue: decouples splitting (producer) from embedding (consumer) ---
+        queue: asyncio.Queue[list[CodeChunk] | None] = asyncio.Queue(maxsize=4)
 
-        for batch_start in range(0, total_files, parallel_batch):
-            if limit_reached:
-                break
+        import time as _time
 
-            batch_end = min(batch_start + parallel_batch, total_files)
-            batch_files = file_paths[batch_start:batch_end]
+        # Shared mutable state + timing
+        state = {
+            "processed": 0,
+            "skipped": 0,
+            "total_chunks": 0,
+            "limit_reached": False,
+            "cache_save_counter": 0,
+            "split_time": 0.0,
+            "embed_time": 0.0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+        }
+        wall_start = _time.monotonic()
 
-            # Submit all file reads + splits to thread pool in parallel
-            futures = [
-                loop.run_in_executor(executor, self._read_and_split_file, fpath)
-                for fpath in batch_files
-            ]
-            results = await asyncio.gather(*futures)
+        # --- Producer: read + split files, push chunk batches to queue ---
+        async def producer():
+            buffer: list[CodeChunk] = []
+            parallel_batch = max_workers * 4
 
-            for i_in_batch, (fpath, chunks) in enumerate(results):
-                if limit_reached:
+            for batch_start in range(0, total_files, parallel_batch):
+                if state["limit_reached"]:
                     break
 
-                idx = batch_start + i_in_batch
-                rel = os.path.relpath(fpath, codebase_path)
+                batch_end = min(batch_start + parallel_batch, total_files)
+                batch_files = file_paths[batch_start:batch_end]
 
-                if chunks is None:
-                    skipped += 1
-                    logger.info("Skipped file [%d/%d]: %s", idx + 1, total_files, rel)
-                    continue
+                # Split files in parallel via thread pool
+                t0 = _time.monotonic()
+                futures = [
+                    loop.run_in_executor(executor, self._read_and_split_file, fpath)
+                    for fpath in batch_files
+                ]
+                results = await asyncio.gather(*futures)
+                state["split_time"] += _time.monotonic() - t0
 
-                logger.info("Processing file [%d/%d]: %s (%d chunks)", idx + 1, total_files, rel, len(chunks))
-
-                for chunk in chunks:
-                    buffer.append(chunk)
-                    total_chunks += 1
-
-                    if len(buffer) >= batch_size:
-                        try:
-                            await loop.run_in_executor(
-                                None, self._flush_buffer, buffer, codebase_path, col_name
-                            )
-                        except Exception as exc:
-                            logger.warning("Batch flush failed, skipping %d chunks: %s", len(buffer), exc)
-                        buffer = []
-
-                    if total_chunks >= chunk_limit:
-                        logger.warning("Chunk limit (%d) reached", chunk_limit)
-                        limit_reached = True
+                for i_in_batch, (fpath, chunks) in enumerate(results):
+                    if state["limit_reached"]:
                         break
 
-                processed += 1
-                pct = 10 + int((idx + 1) / total_files * 90)
-                _report(progress, f"Processing ({idx+1}/{total_files})…", idx + 1, total_files, pct)
+                    idx = batch_start + i_in_batch
+                    rel = os.path.relpath(fpath, codebase_path)
 
-            # Yield control between parallel batches so MCP can respond
-            await asyncio.sleep(0)
+                    if chunks is None:
+                        state["skipped"] += 1
+                        continue
+
+                    logger.info("Processing file [%d/%d]: %s (%d chunks)",
+                                idx + 1, total_files, rel, len(chunks))
+
+                    for chunk in chunks:
+                        buffer.append(chunk)
+                        state["total_chunks"] += 1
+
+                        if len(buffer) >= batch_size:
+                            await queue.put(buffer)
+                            buffer = []
+
+                        if state["total_chunks"] >= chunk_limit:
+                            logger.warning("Chunk limit (%d) reached", chunk_limit)
+                            state["limit_reached"] = True
+                            break
+
+                    state["processed"] += 1
+                    pct = 10 + int((idx + 1) / total_files * 90)
+                    _report(progress, f"Processing ({idx+1}/{total_files})…",
+                            idx + 1, total_files, pct)
+
+            # Flush remaining buffer
+            if buffer:
+                await queue.put(buffer)
+
+            # Signal consumer to stop
+            await queue.put(None)
+
+        # --- Consumer: embed + insert chunk batches from queue ---
+        async def consumer():
+            while True:
+                batch = await queue.get()
+                if batch is None:
+                    break  # producer is done
+
+                t0 = _time.monotonic()
+                try:
+                    await loop.run_in_executor(
+                        None, self._flush_buffer, batch, codebase_path, col_name
+                    )
+                except Exception as exc:
+                    logger.warning("Batch flush failed, skipping %d chunks: %s",
+                                   len(batch), exc)
+                state["embed_time"] += _time.monotonic() - t0
+
+                # Periodically save embedding cache (every 10 batches)
+                state["cache_save_counter"] += 1
+                if state["cache_save_counter"] % 10 == 0:
+                    self._embedding_cache.save()
+
+                queue.task_done()
+
+        # --- Run producer and consumer concurrently ---
+        await asyncio.gather(producer(), consumer())
 
         executor.shutdown(wait=False)
 
-        if buffer:
-            try:
-                await loop.run_in_executor(
-                    None, self._flush_buffer, buffer, codebase_path, col_name
-                )
-            except Exception as exc:
-                logger.warning("Final batch flush failed, skipping %d chunks: %s", len(buffer), exc)
+        # Final persist (all inserts used defer_persist=True)
+        self.vector_db.persist(col_name)
 
+        # Final cache save
+        self._embedding_cache.save()
+
+        wall_elapsed = _time.monotonic() - wall_start
+        chunks = state["total_chunks"]
+        throughput = chunks / wall_elapsed if wall_elapsed > 0 else 0
+        overlap = max(0, state["split_time"] + state["embed_time"] - wall_elapsed)
         logger.info(
             "Indexing complete: %d/%d files processed, %d skipped, %d chunks, status=%s",
-            processed, total_files, skipped, total_chunks,
-            "limit_reached" if limit_reached else "completed",
+            state["processed"], total_files, state["skipped"], chunks,
+            "limit_reached" if state["limit_reached"] else "completed",
+        )
+        logger.info(
+            "⏱ Timing: wall=%.1fs, split=%.1fs, embed=%.1fs, overlap=%.1fs, throughput=%.1f chunks/s",
+            wall_elapsed, state["split_time"], state["embed_time"], overlap, throughput,
         )
 
         return {
-            "processed_files": processed,
+            "processed_files": state["processed"],
             "total_files": total_files,
-            "skipped_files": skipped,
-            "total_chunks": total_chunks,
-            "status": "limit_reached" if limit_reached else "completed",
+            "skipped_files": state["skipped"],
+            "total_chunks": state["total_chunks"],
+            "status": "limit_reached" if state["limit_reached"] else "completed",
+            "wall_time_s": round(wall_elapsed, 1),
+            "split_time_s": round(state["split_time"], 1),
+            "embed_time_s": round(state["embed_time"], 1),
+            "overlap_s": round(overlap, 1),
+            "throughput_chunks_per_s": round(throughput, 1),
         }
 
     def _flush_buffer(
         self, chunks: list[CodeChunk], codebase_path: str, col_name: str
     ) -> None:
-        """Convert CodeChunks → LlamaIndex TextNodes → insert into FAISS + BM25."""
+        """Convert CodeChunks → LlamaIndex TextNodes → insert into FAISS + BM25.
+
+        Uses embedding cache to skip re-embedding unchanged chunks (Cursor-style).
+        Adds obfuscated paths to metadata for privacy.
+        """
         nodes: list[TextNode] = []
+        cached_nodes: list[tuple[TextNode, list[float]]] = []  # nodes with cached embeddings
         bm25 = self._bm25_indices.get(col_name)
+        cache = self._embedding_cache
 
         # Truncate chunk text to stay within embedding model context limits.
         # nomic-embed-text has a 2048 token context; ~4 chars/token for code
         # gives a safe limit of ~8000 chars.  We cap at chunk_size as the max.
         max_embed_chars = self._cfg.chunk_size
+        cache_hits = 0
 
         for chunk in chunks:
             text = chunk.content
@@ -572,11 +662,15 @@ class Context:
             ext = os.path.splitext(chunk.file_path)[1] if chunk.file_path else ""
             node_id = _generate_id(rel, chunk.start_line, chunk.end_line, text)
 
+            # Path obfuscation — store encrypted path alongside plain path
+            obfuscated_path = self._path_obfuscator.obfuscate(rel)
+
             node = TextNode(
                 text=text,
                 id_=node_id,
                 metadata={
                     "relative_path": rel,
+                    "obfuscated_path": obfuscated_path,
                     "start_line": chunk.start_line,
                     "end_line": chunk.end_line,
                     "file_extension": ext,
@@ -592,7 +686,15 @@ class Context:
             # Don't embed metadata fields — only the code text.
             node.excluded_embed_metadata_keys = list(node.metadata.keys())
             node.excluded_llm_metadata_keys = list(node.metadata.keys())
-            nodes.append(node)
+
+            # Embedding cache lookup — skip embedding API call for unchanged chunks
+            text_hash = cache.content_hash(text)
+            cached_embedding = cache.get(text_hash)
+            if cached_embedding is not None:
+                cached_nodes.append((node, cached_embedding))
+                cache_hits += 1
+            else:
+                nodes.append(node)
 
             # Also add to BM25 sparse index (parallel indexing)
             if bm25:
@@ -605,12 +707,54 @@ class Context:
                     language=chunk.language,
                 )
 
-        self._insert_nodes_safe(col_name, nodes)
+        if cache_hits:
+            logger.info(
+                "Embedding cache: %d hits, %d misses (skipping %d API calls)",
+                cache_hits, len(nodes), cache_hits,
+            )
 
-    def _insert_nodes_safe(self, col_name: str, nodes: list[TextNode]) -> None:
+        # Insert cached nodes directly with pre-computed embeddings (deferred persist)
+        if cached_nodes:
+            self._insert_cached_nodes(col_name, cached_nodes, defer_persist=True)
+
+        # Embed and insert uncached nodes (calls embedding API)
+        if nodes:
+            # Pre-compute embeddings so we can cache them AND pass to FAISS.
+            # Split into sub-batches and embed concurrently for higher GPU utilization
+            # (set OLLAMA_NUM_PARALLEL=4 on the Ollama server for best results).
+            embed_model = self.vector_db._embed_model
+            try:
+                texts = [n.text for n in nodes]
+                sub_batch_size = max(25, len(texts) // 4)  # ~4 concurrent requests
+                sub_batches = [
+                    texts[i:i + sub_batch_size]
+                    for i in range(0, len(texts), sub_batch_size)
+                ]
+
+                if len(sub_batches) > 1:
+                    from concurrent.futures import ThreadPoolExecutor as _TPE
+                    with _TPE(max_workers=len(sub_batches)) as emb_pool:
+                        emb_results = list(emb_pool.map(
+                            embed_model.get_text_embedding_batch, sub_batches
+                        ))
+                    embeddings = [e for batch_embs in emb_results for e in batch_embs]
+                else:
+                    embeddings = embed_model.get_text_embedding_batch(texts)
+
+                for node, emb in zip(nodes, embeddings):
+                    node.embedding = emb
+                    cache.put(cache.content_hash(node.text), emb)
+            except Exception as exc:
+                logger.warning("Pre-embedding failed, falling back to insert_nodes: %s", exc)
+
+            self._insert_nodes_safe(col_name, nodes, defer_persist=True)
+
+    def _insert_nodes_safe(
+        self, col_name: str, nodes: list[TextNode], *, defer_persist: bool = False
+    ) -> None:
         """Insert nodes into FAISS, retrying individual nodes on context-length errors."""
         try:
-            self.vector_db.insert_nodes(col_name, nodes)
+            self.vector_db.insert_nodes(col_name, nodes, defer_persist=defer_persist)
         except Exception as exc:
             exc_str = str(exc).lower()
             if "context length" in exc_str or "too long" in exc_str or "exceeds" in exc_str:
@@ -651,6 +795,33 @@ class Context:
             "Skipping node %s after 4 truncation attempts",
             node.metadata.get("relative_path", "?"),
         )
+
+    def _insert_cached_nodes(
+        self, col_name: str, cached_nodes: list[tuple[TextNode, list[float]]],
+        *, defer_persist: bool = False,
+    ) -> None:
+        """Insert nodes with pre-computed embeddings directly into FAISS (no API call)."""
+        index = self.vector_db._indices.get(col_name)
+        if index is None:
+            return
+
+        for node, embedding in cached_nodes:
+            # Set the embedding directly on the node so LlamaIndex skips the API call
+            node.embedding = embedding
+
+        nodes = [n for n, _ in cached_nodes]
+
+        # Clear soft-deletions for re-inserted ref_doc_ids
+        deleted = self.vector_db._deleted_refs.get(col_name)
+        if deleted:
+            for node in nodes:
+                ref = node.ref_doc_id
+                if ref and ref in deleted:
+                    deleted.discard(ref)
+
+        index.insert_nodes(nodes)
+        if not defer_persist:
+            self.vector_db._persist(col_name)
 
     async def _load_ignore_patterns(self, codebase_path: str) -> None:
         # 1. Local ignore files (.gitignore, .contextignore)

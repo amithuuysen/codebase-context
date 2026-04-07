@@ -114,10 +114,12 @@ codecontext/
 │   ├── types.py                   # Config, CodeChunk, SemanticSearchResult, constants
 │   ├── context.py                 # Orchestrator: index → hybrid search → rerank
 │   ├── embedding.py               # Embedding factory (OpenAI / Ollama / local)
+│   ├── embedding_cache.py         # SHA-256 content hash → embedding vector cache
 │   ├── vectordb.py                # FAISS IndexFlatIP (dense vectors, cosine similarity)
 │   ├── bm25.py                    # BM25 sparse keyword index (inverted index + IDF)
 │   ├── hybrid_search.py           # RRF fusion (FAISS + BM25 → merged ranking)
 │   ├── merkle.py                  # Merkle tree sync (directory-aware O(changes) diff)
+│   ├── path_obfuscation.py        # HMAC-SHA256 path segment encryption for privacy
 │   ├── reranker.py                # Cross-encoder reranker (optional Stage 2)
 │   ├── sync.py                    # Flat file-hash sync (SHA-256 fallback)
 │   └── splitter/
@@ -175,9 +177,12 @@ All data persists locally under `~/.context/`:
 │       └── collection_meta.json
 ├── bm25_store/                        # Sparse keyword indices
 │   └── code_chunks_<hash>.json
+├── embedding_cache/                   # Embedding vector cache
+│   └── ollama_nomic-embed-text.json
 ├── merkle/                            # Merkle tree snapshots
 │   ├── merkle_<hash>.json             # Directory-aware tree
 │   └── <hash>.json                    # Flat file-hash fallback
+├── path_obfuscation_key               # HMAC key (chmod 600)
 └── mcp-codebase-snapshot.json         # Indexing state (V2 format)
 ```
 
@@ -193,8 +198,8 @@ All data persists locally under `~/.context/`:
 | `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama server URL |
 | `OLLAMA_MODEL` | `nomic-embed-text` | Ollama model |
 | `LOCAL_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Sentence-transformers model |
-| `CHUNK_SIZE` | `1500` | Max characters per code chunk |
-| `CHUNK_OVERLAP` | `200` | Overlap between chunks |
+| `CHUNK_SIZE` | `3000` | Max characters per code chunk |
+| `CHUNK_OVERLAP` | `300` | Overlap between chunks |
 | `EMBEDDING_BATCH_SIZE` | `100` | Chunks per embedding API call |
 | `CODECONTEXT_DATA_DIR` | `~/.context` | Data storage directory |
 | `RERANKER_PROVIDER` | `none` | `none` or `local` (enables cross-encoder) |
@@ -207,11 +212,6 @@ All data persists locally under `~/.context/`:
 ```bash
 cd codebase-context
 uv sync
-
-# With optional extras
-uv sync --extra ollama        # Ollama embeddings
-uv sync --extra local         # Fully offline embeddings (sentence-transformers)
-uv sync --extra reranker      # Cross-encoder reranker (Stage 2 precision)
 ```
 
 ### 2. Configure Embeddings

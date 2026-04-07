@@ -1,6 +1,6 @@
 [project]
 name = "codecontext"
-version = "0.2.0"
+version = "0.3.0"
 description = "Semantic code search MCP server — Tree-sitter + LlamaIndex + FAISS"
 requires-python = ">=3.10"
 dependencies = [

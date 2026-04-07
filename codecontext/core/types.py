@@ -91,8 +91,8 @@ class Config:
     ollama_host: str = "http://127.0.0.1:11434"
     ollama_model: str = "nomic-embed-text"
     local_model: str = "all-MiniLM-L6-v2"
-    chunk_size: int = 1500
-    chunk_overlap: int = 200
+    chunk_size: int = 3000
+    chunk_overlap: int = 300
     embedding_batch_size: int = 100
     chunk_limit: int = 450_000
     sync_interval_seconds: int = 300

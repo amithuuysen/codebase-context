@@ -101,7 +101,9 @@ class FaissVectorDB:
     # Insert LlamaIndex TextNodes
     # ------------------------------------------------------------------
 
-    def insert_nodes(self, collection_name: str, nodes: list[TextNode]) -> None:
+    def insert_nodes(
+        self, collection_name: str, nodes: list[TextNode], *, defer_persist: bool = False
+    ) -> None:
         index = self._indices.get(collection_name)
         if index is None:
             raise KeyError(f"Collection '{collection_name}' does not exist")
@@ -117,7 +119,8 @@ class FaissVectorDB:
                     deleted.discard(ref)
 
         index.insert_nodes(nodes)
-        self._persist(collection_name)
+        if not defer_persist:
+            self._persist(collection_name)
 
     # ------------------------------------------------------------------
     # Delete by ref_doc_id  (= relative file path)
@@ -188,6 +191,10 @@ class FaissVectorDB:
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
+
+    def persist(self, name: str) -> None:
+        """Public alias so callers can trigger a deferred persist."""
+        self._persist(name)
 
     def _persist(self, name: str) -> None:
         col_dir = self._persist_dir / name

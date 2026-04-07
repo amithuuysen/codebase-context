@@ -1,0 +1,52 @@
+# TODO — Cursor Parity Features
+
+## Completed
+
+- [x] Merkle tree sync (O(changes) instead of O(files))
+- [x] AST-aware chunking (Tree-sitter: functions, classes, methods)
+- [x] Hybrid search (FAISS dense + BM25 sparse + RRF fusion)
+- [x] Cross-encoder reranker (optional Stage 2 precision)
+- [x] Parallel file reading/splitting (ThreadPoolExecutor)
+- [x] Ollama embed_batch_size=100 (10x fewer API round-trips)
+- [x] Embedding cache by chunk hash (SHA-256 → embedding vector)
+- [x] Path obfuscation (HMAC-SHA256 per segment)
+- [x] Background 5-min periodic sync
+- [x] Producer/consumer pipeline (asyncio.Queue, concurrent splitting + embedding)
+- [x] Concurrent embedding sub-batches (~4 parallel threads per flush)
+- [x] Deferred FAISS persistence (single write at end of indexing)
+- [x] Adaptive thread pool (scales to CPU cores, up to 14 for M4 Pro)
+- [x] Periodic embedding cache saves (every 10 batches)
+- [x] Pipeline timing instrumentation (wall, split, embed, overlap, throughput)
+
+## Yet To Implement
+
+### 1. Skip unchanged files during initial index (Easy)
+- Before processing a file, check if all its chunk node IDs already exist in FAISS
+- Skip files whose content hash hasn't changed since last index
+- Avoids re-embedding files that are already in the index
+
+### 2. Git history indexing (Medium)
+- Index commit SHAs, changed files per commit
+- Use `gitpython` to walk recent commit history
+- Enable queries like "when was authentication last changed?"
+
+### 3. Team index sharing via SimHash (Hard)
+- Compute SimHash from Merkle tree root
+- Find similar existing indexes from teammates (92% avg overlap)
+- Copy existing index → diff only divergent files
+- Requires shared server/storage backend
+- Cursor reports: time-to-first-query drops from hours to seconds
+
+### 4. Custom embedding model (Hard)
+- Fine-tune embedding model on agent session traces
+- Use LLM-ranked relevance from real coding tasks as training signal
+- Requires: training data pipeline, GPU infrastructure
+- Consider fine-tuning `all-MiniLM-L6-v2` or `nomic-embed-text` as starting point
+- Cursor's biggest proprietary advantage
+
+## Performance Notes
+
+- 20K-file codebase (Zoho CRM): ~20,583 files
+- Current model: `nomic-embed-text` (137M params, 768-dim, 8K context)
+- Chunk size: 3000 chars, overlap: 300
+- Batch size: 100 chunks per Ollama API call

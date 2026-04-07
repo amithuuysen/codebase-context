@@ -20,8 +20,10 @@ from .types import (
 )
 from .embedding import create_embedding
 from .bm25 import BM25Index
+from .embedding_cache import EmbeddingCache
 from .hybrid_search import HybridSearcher, reciprocal_rank_fusion
 from .merkle import MerkleSynchronizer
+from .path_obfuscation import PathObfuscator
 from .reranker import Reranker
 from .splitter import AstSplitter, Splitter, TextSplitter
 from .sync import FileSynchronizer
