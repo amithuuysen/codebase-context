@@ -51,11 +51,14 @@ async def background_indexing(
             result["indexed_files"],
             result["total_chunks"],
             index_status=result["status"],
+            total_files=result.get("total_files", result["indexed_files"]),
+            skipped_files=result.get("skipped_files", 0),
         )
         snap.save_snapshot()
         logger.info(
-            "Indexing complete for %s: %d files, %d chunks, status=%s",
-            abs_path, result["indexed_files"], result["total_chunks"], result["status"],
+            "Indexing complete for %s: %d/%d files, %d skipped, %d chunks, status=%s",
+            abs_path, result["indexed_files"], result.get("total_files", result["indexed_files"]),
+            result.get("skipped_files", 0), result["total_chunks"], result["status"],
         )
     except Exception as exc:
         pct = snap.get_indexing_progress(abs_path) or 0

@@ -66,7 +66,12 @@ def _build_context(cfg: Config) -> Context:
 # FastMCP instance — tools are registered via @mcp.tool() below
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("codecontext")
+mcp = FastMCP(
+    "codecontext",
+    host="127.0.0.1",
+    port=8877,
+    streamable_http_path="/mcp",
+)
 
 # Module-level state filled in by main() before the server starts
 _ctx: Context
@@ -263,7 +268,8 @@ async def get_indexing_status(path: str) -> str:
         return (
             f"**Codebase:** {abs_path}\n"
             f"**Status:** Indexed ✅\n"
-            f"**Files indexed:** {info.indexed_files}\n"
+            f"**Files indexed:** {info.indexed_files}/{info.total_files}"
+            f"{f' ({info.skipped_files} skipped)' if info.skipped_files else ''}\n"
             f"**Total chunks:** {info.total_chunks}\n"
             f"**Index status:** {info.index_status}\n"
             f"**Last updated:** {info.last_updated}"
@@ -321,8 +327,9 @@ def main() -> None:
 
     install_shutdown_handlers()
 
-    logger.info("MCP server starting on stdio...")
-    mcp.run(transport="stdio")
+    transport = os.getenv("MCP_TRANSPORT", "streamable-http")
+    logger.info("MCP server starting on %s...", transport)
+    mcp.run(transport=transport)
 
 
 if __name__ == "__main__":

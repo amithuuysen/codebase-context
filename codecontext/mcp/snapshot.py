@@ -30,6 +30,8 @@ _LOCK_RETRY_MS = 100
 class CodebaseInfo:
     status: str  # "indexed" | "indexing" | "indexfailed"
     indexed_files: int = 0
+    total_files: int = 0
+    skipped_files: int = 0
     total_chunks: int = 0
     index_status: str = "completed"  # "completed" | "limit_reached"
     indexing_percentage: int = 0
@@ -103,10 +105,14 @@ class SnapshotManager:
         indexed_files: int = 0,
         total_chunks: int = 0,
         index_status: str = "completed",
+        total_files: int = 0,
+        skipped_files: int = 0,
     ) -> None:
         self._codebases[path] = CodebaseInfo(
             status="indexed",
             indexed_files=indexed_files,
+            total_files=total_files or indexed_files,
+            skipped_files=skipped_files,
             total_chunks=total_chunks,
             index_status=index_status,
             last_updated=_now(),

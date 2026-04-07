@@ -56,10 +56,12 @@ def show_help() -> None:
 Context MCP Server (Python) — Semantic code search via MCP protocol.
 
 USAGE
-  codecontext                     Start the MCP server (stdio)
+  codecontext                     Start the MCP server (streamable-http on :8080)
+  MCP_TRANSPORT=stdio codecontext Start using stdio transport
   codecontext --help              Show this message
 
 ENVIRONMENT VARIABLES
+  MCP_TRANSPORT        streamable-http | stdio | sse  (default: streamable-http)
   EMBEDDING_PROVIDER   openai | ollama | local   (default: openai)
   EMBEDDING_MODEL      Model name (default: text-embedding-3-small)
   OPENAI_API_KEY       Required for OpenAI provider
@@ -67,8 +69,8 @@ ENVIRONMENT VARIABLES
   OLLAMA_HOST          Ollama server (default: http://127.0.0.1:11434)
   OLLAMA_MODEL         Ollama model (default: nomic-embed-text)
   CODECONTEXT_DATA_DIR Persistence directory (default: ~/.context)
-  CHUNK_SIZE           Max chars per chunk (default: 2500)
-  CHUNK_OVERLAP        Overlap between chunks (default: 300)
+  CHUNK_SIZE           Max chars per chunk (default: 1500)
+  CHUNK_OVERLAP        Overlap between chunks (default: 200)
   CHUNK_LIMIT          Max total chunks (default: 450000)
   SYNC_INTERVAL_SECONDS  Background sync interval (default: 300)
 

@@ -13,6 +13,7 @@ Key accuracy techniques (from Cursor research):
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -219,12 +220,15 @@ class Context:
             bm25.save(bm25_path)
 
         logger.info(
-            "Indexing complete: %d files, %d chunks",
-            result["processed_files"], result["total_chunks"],
+            "Indexing complete: %d/%d files processed, %d skipped, %d chunks",
+            result["processed_files"], result["total_files"],
+            result["skipped_files"], result["total_chunks"],
         )
         _report(progress, "Indexing complete!", result["processed_files"], len(files), 100)
         return {
             "indexed_files": result["processed_files"],
+            "total_files": result["total_files"],
+            "skipped_files": result["skipped_files"],
             "total_chunks": result["total_chunks"],
             "status": result["status"],
         }
@@ -439,13 +443,20 @@ class Context:
         limit_reached = False
         col_name = self.get_collection_name(codebase_path)
 
+        total_files = len(file_paths)
+        skipped = 0
+        logger.info("Starting indexing: %d files to process", total_files)
+
+        loop = asyncio.get_event_loop()
+
         for i, fpath in enumerate(file_paths):
             rel = os.path.relpath(fpath, codebase_path)
-            logger.info("Processing file [%d/%d]: %s", i + 1, len(file_paths), rel)
+            logger.info("Processing file [%d/%d]: %s", i + 1, total_files, rel)
             try:
                 content = Path(fpath).read_text(errors="replace")
             except Exception as exc:
                 logger.warning("Skipping %s: %s", fpath, exc)
+                skipped += 1
                 continue
 
             ext = os.path.splitext(fpath)[1]
@@ -458,7 +469,9 @@ class Context:
 
                 if len(buffer) >= batch_size:
                     try:
-                        self._flush_buffer(buffer, codebase_path, col_name)
+                        await loop.run_in_executor(
+                            None, self._flush_buffer, buffer, codebase_path, col_name
+                        )
                     except Exception as exc:
                         logger.warning("Batch flush failed, skipping %d chunks: %s", len(buffer), exc)
                     buffer = []
@@ -469,19 +482,33 @@ class Context:
                     break
 
             processed += 1
-            pct = 10 + int((i + 1) / len(file_paths) * 90)
-            _report(progress, f"Processing ({i+1}/{len(file_paths)})…", i + 1, len(file_paths), pct)
+            pct = 10 + int((i + 1) / total_files * 90)
+            _report(progress, f"Processing ({i+1}/{total_files})…", i + 1, total_files, pct)
             if limit_reached:
                 break
 
+            # Yield control every 10 files so MCP can respond to other requests
+            if (i + 1) % 10 == 0:
+                await asyncio.sleep(0)
+
         if buffer:
             try:
-                self._flush_buffer(buffer, codebase_path, col_name)
+                await loop.run_in_executor(
+                    None, self._flush_buffer, buffer, codebase_path, col_name
+                )
             except Exception as exc:
                 logger.warning("Final batch flush failed, skipping %d chunks: %s", len(buffer), exc)
 
+        logger.info(
+            "Indexing complete: %d/%d files processed, %d skipped, %d chunks, status=%s",
+            processed, total_files, skipped, total_chunks,
+            "limit_reached" if limit_reached else "completed",
+        )
+
         return {
             "processed_files": processed,
+            "total_files": total_files,
+            "skipped_files": skipped,
             "total_chunks": total_chunks,
             "status": "limit_reached" if limit_reached else "completed",
         }

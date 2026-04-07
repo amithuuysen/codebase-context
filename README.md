@@ -185,6 +185,7 @@ All data persists locally under `~/.context/`:
 
 | Variable | Default | Description |
 |---|---|---|
+| `MCP_TRANSPORT` | `streamable-http` | `streamable-http`, `stdio`, or `sse` |
 | `EMBEDDING_PROVIDER` | `openai` | `openai`, `ollama`, or `local` |
 | `EMBEDDING_MODEL` | auto | Model name (auto-selected per provider) |
 | `OPENAI_API_KEY` | — | Required for OpenAI provider |
@@ -192,8 +193,8 @@ All data persists locally under `~/.context/`:
 | `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama server URL |
 | `OLLAMA_MODEL` | `nomic-embed-text` | Ollama model |
 | `LOCAL_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Sentence-transformers model |
-| `CHUNK_SIZE` | `2500` | Max characters per code chunk |
-| `CHUNK_OVERLAP` | `300` | Overlap between chunks |
+| `CHUNK_SIZE` | `1500` | Max characters per code chunk |
+| `CHUNK_OVERLAP` | `200` | Overlap between chunks |
 | `EMBEDDING_BATCH_SIZE` | `100` | Chunks per embedding API call |
 | `CODECONTEXT_DATA_DIR` | `~/.context` | Data storage directory |
 | `RERANKER_PROVIDER` | `none` | `none` or `local` (enables cross-encoder) |
@@ -205,22 +206,12 @@ All data persists locally under `~/.context/`:
 
 ```bash
 cd python-port
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
-```
+uv sync
 
-Optional extras:
-
-```bash
-# Ollama embeddings
-pip install -e ".[ollama]"
-
-# Fully offline embeddings (sentence-transformers)
-pip install -e ".[local]"
-
-# Cross-encoder reranker (Stage 2 precision)
-pip install -e ".[reranker]"
+# With optional extras
+uv sync --extra ollama        # Ollama embeddings
+uv sync --extra local         # Fully offline embeddings (sentence-transformers)
+uv sync --extra reranker      # Cross-encoder reranker (Stage 2 precision)
 ```
 
 ### 2. Configure Embeddings
@@ -248,21 +239,75 @@ export RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
 ### 4. Run as MCP Server
 
 ```bash
-codecontext
+# Default: streamable-http on http://127.0.0.1:8877/mcp
+uv run codecontext
+
+# Or use stdio transport (for clients that spawn the process)
+MCP_TRANSPORT=stdio uv run codecontext
 ```
 
-### 5. Connect to Claude Desktop / VS Code Copilot
+### 5. Connect to VS Code Copilot / Claude Desktop
 
-Add to your MCP configuration (e.g. `~/.config/claude/claude_desktop_config.json`):
+#### Option A: Streamable HTTP (recommended)
 
+Start the server first, then configure your MCP client to connect:
+
+**VS Code** (`.vscode/mcp.json`):
+```json
+{
+  "servers": {
+    "codecontext": {
+      "type": "http",
+      "url": "http://127.0.0.1:8877/mcp"
+    }
+  }
+}
+```
+
+**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 ```json
 {
   "mcpServers": {
     "codecontext": {
-      "command": "/path/to/python-port/.venv/bin/codecontext",
+      "type": "http",
+      "url": "http://127.0.0.1:8877/mcp"
+    }
+  }
+}
+```
+
+#### Option B: stdio (VS Code/Claude spawns the process)
+
+**VS Code** (`.vscode/mcp.json`):
+```json
+{
+  "servers": {
+    "codecontext": {
+      "command": "uv",
+      "args": ["run", "codecontext"],
+      "cwd": "/path/to/python-port",
       "env": {
-        "EMBEDDING_PROVIDER": "openai",
-        "OPENAI_API_KEY": "sk-..."
+        "MCP_TRANSPORT": "stdio",
+        "EMBEDDING_PROVIDER": "ollama",
+        "OLLAMA_HOST": "http://127.0.0.1:11434"
+      }
+    }
+  }
+}
+```
+
+**Claude Desktop**:
+```json
+{
+  "mcpServers": {
+    "codecontext": {
+      "command": "uv",
+      "args": ["run", "codecontext"],
+      "cwd": "/path/to/python-port",
+      "env": {
+        "MCP_TRANSPORT": "stdio",
+        "EMBEDDING_PROVIDER": "ollama",
+        "OLLAMA_HOST": "http://127.0.0.1:11434"
       }
     }
   }
@@ -273,11 +318,11 @@ Add to your MCP configuration (e.g. `~/.config/claude/claude_desktop_config.json
 
 ```bash
 # Core pipeline tests
-python test_components.py
+uv run python test_components.py
 
 # Accuracy validation (AST splitting, cosine similarity, etc.)
-python test_accuracy.py
+uv run python test_accuracy.py
 
 # Hybrid architecture tests (BM25, RRF, Merkle tree, reranker)
-python test_hybrid.py
+uv run python test_hybrid.py
 ```
