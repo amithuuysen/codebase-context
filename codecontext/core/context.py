@@ -429,6 +429,18 @@ class Context:
                 return True
         return False
 
+    def _read_and_split_file(self, fpath: str) -> tuple[str, list[CodeChunk] | None]:
+        """Read a file and split it into chunks (runs in thread pool)."""
+        try:
+            content = Path(fpath).read_text(errors="replace")
+        except Exception as exc:
+            logger.warning("Skipping %s: %s", fpath, exc)
+            return fpath, None
+        ext = os.path.splitext(fpath)[1]
+        language = EXTENSION_TO_LANGUAGE.get(ext, "text")
+        chunks = self.splitter.split(content, language, fpath)
+        return fpath, chunks
+
     async def _process_file_list(
         self,
         file_paths: list[str],
@@ -449,47 +461,69 @@ class Context:
 
         loop = asyncio.get_event_loop()
 
-        for i, fpath in enumerate(file_paths):
-            rel = os.path.relpath(fpath, codebase_path)
-            logger.info("Processing file [%d/%d]: %s", i + 1, total_files, rel)
-            try:
-                content = Path(fpath).read_text(errors="replace")
-            except Exception as exc:
-                logger.warning("Skipping %s: %s", fpath, exc)
-                skipped += 1
-                continue
+        # --- Parallel file reading + AST splitting via thread pool ---
+        from concurrent.futures import ThreadPoolExecutor
+        max_workers = min(os.cpu_count() or 4, 8)
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        logger.info("Using %d workers for parallel file splitting", max_workers)
 
-            ext = os.path.splitext(fpath)[1]
-            language = EXTENSION_TO_LANGUAGE.get(ext, "text")
-            chunks = self.splitter.split(content, language, fpath)
+        # Process files in parallel batches, pipeline with embedding
+        parallel_batch = max_workers * 4  # read+split this many files at once
 
-            for chunk in chunks:
-                buffer.append(chunk)
-                total_chunks += 1
-
-                if len(buffer) >= batch_size:
-                    try:
-                        await loop.run_in_executor(
-                            None, self._flush_buffer, buffer, codebase_path, col_name
-                        )
-                    except Exception as exc:
-                        logger.warning("Batch flush failed, skipping %d chunks: %s", len(buffer), exc)
-                    buffer = []
-
-                if total_chunks >= chunk_limit:
-                    logger.warning("Chunk limit (%d) reached", chunk_limit)
-                    limit_reached = True
-                    break
-
-            processed += 1
-            pct = 10 + int((i + 1) / total_files * 90)
-            _report(progress, f"Processing ({i+1}/{total_files})…", i + 1, total_files, pct)
+        for batch_start in range(0, total_files, parallel_batch):
             if limit_reached:
                 break
 
-            # Yield control every 10 files so MCP can respond to other requests
-            if (i + 1) % 10 == 0:
-                await asyncio.sleep(0)
+            batch_end = min(batch_start + parallel_batch, total_files)
+            batch_files = file_paths[batch_start:batch_end]
+
+            # Submit all file reads + splits to thread pool in parallel
+            futures = [
+                loop.run_in_executor(executor, self._read_and_split_file, fpath)
+                for fpath in batch_files
+            ]
+            results = await asyncio.gather(*futures)
+
+            for i_in_batch, (fpath, chunks) in enumerate(results):
+                if limit_reached:
+                    break
+
+                idx = batch_start + i_in_batch
+                rel = os.path.relpath(fpath, codebase_path)
+
+                if chunks is None:
+                    skipped += 1
+                    logger.info("Skipped file [%d/%d]: %s", idx + 1, total_files, rel)
+                    continue
+
+                logger.info("Processing file [%d/%d]: %s (%d chunks)", idx + 1, total_files, rel, len(chunks))
+
+                for chunk in chunks:
+                    buffer.append(chunk)
+                    total_chunks += 1
+
+                    if len(buffer) >= batch_size:
+                        try:
+                            await loop.run_in_executor(
+                                None, self._flush_buffer, buffer, codebase_path, col_name
+                            )
+                        except Exception as exc:
+                            logger.warning("Batch flush failed, skipping %d chunks: %s", len(buffer), exc)
+                        buffer = []
+
+                    if total_chunks >= chunk_limit:
+                        logger.warning("Chunk limit (%d) reached", chunk_limit)
+                        limit_reached = True
+                        break
+
+                processed += 1
+                pct = 10 + int((idx + 1) / total_files * 90)
+                _report(progress, f"Processing ({idx+1}/{total_files})…", idx + 1, total_files, pct)
+
+            # Yield control between parallel batches so MCP can respond
+            await asyncio.sleep(0)
+
+        executor.shutdown(wait=False)
 
         if buffer:
             try:
