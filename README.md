@@ -205,7 +205,7 @@ All data persists locally under `~/.context/`:
 ### 1. Install
 
 ```bash
-cd python-port
+cd codebase-context
 uv sync
 
 # With optional extras
@@ -285,7 +285,7 @@ Start the server first, then configure your MCP client to connect:
     "codecontext": {
       "command": "uv",
       "args": ["run", "codecontext"],
-      "cwd": "/path/to/python-port",
+      "cwd": "/path/to/codebase-context",
       "env": {
         "MCP_TRANSPORT": "stdio",
         "EMBEDDING_PROVIDER": "ollama",
@@ -303,7 +303,7 @@ Start the server first, then configure your MCP client to connect:
     "codecontext": {
       "command": "uv",
       "args": ["run", "codecontext"],
-      "cwd": "/path/to/python-port",
+      "cwd": "/path/to/codebase-context",
       "env": {
         "MCP_TRANSPORT": "stdio",
         "EMBEDDING_PROVIDER": "ollama",
