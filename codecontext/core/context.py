@@ -440,6 +440,8 @@ class Context:
         col_name = self.get_collection_name(codebase_path)
 
         for i, fpath in enumerate(file_paths):
+            rel = os.path.relpath(fpath, codebase_path)
+            logger.info("Processing file [%d/%d]: %s", i + 1, len(file_paths), rel)
             try:
                 content = Path(fpath).read_text(errors="replace")
             except Exception as exc:
