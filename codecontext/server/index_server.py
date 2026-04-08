@@ -1,18 +1,15 @@
-"""
-Index Server — centralized HTTP API for team codebase indexing.
+"""Index Server — centralized HTTP API for remote codebase indexing.
 
 Architecture:
-  - Developers send files (or file diffs) to this server
-  - Server indexes them into FAISS + BM25 (shared indexes)
-  - Developers search via their local MCP proxy
-  - SimHash registry enables index reuse across teammates
+  - User sends files from local machine to this server
+  - Server indexes them into FAISS + BM25
+  - User searches via their local MCP proxy
 
 Endpoints:
   POST /api/upload       — Upload files for indexing
   POST /api/index        — Trigger indexing of uploaded files
   POST /api/search       — Search indexed codebase
   GET  /api/status/:id   — Get indexing status
-  POST /api/simhash      — Register/lookup SimHash for index sharing
   GET  /api/collections  — List all indexed codebases
   DELETE /api/clear/:id  — Clear an index
 """
@@ -21,11 +18,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import os
 import shutil
-import tempfile
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -42,7 +37,6 @@ from mcp.server.transport_security import TransportSecuritySettings
 from codecontext.core.context import Context
 from codecontext.core.embedding import create_embedding
 from codecontext.core.reranker import Reranker
-from codecontext.core.simhash import compute_simhash, simhash_similarity
 from codecontext.core.splitter import AstSplitter
 from codecontext.core.types import Config
 from codecontext.core.vectordb import FaissVectorDB
@@ -52,10 +46,6 @@ logger = logging.getLogger("codecontext.server")
 # Server state
 _ctx: Context | None = None
 _cfg: Config | None = None
-
-# SimHash registry: {workspace_id: {"simhash": str, "collection": str, "updated": float}}
-_simhash_registry: dict[str, dict[str, Any]] = {}
-_simhash_registry_path: Path | None = None
 
 # Upload staging: {workspace_id: staging_dir_path}
 _upload_staging: dict[str, str] = {}
@@ -235,9 +225,6 @@ async def _background_index(workspace_id: str, staging_dir: str, force: bool) ->
             "started": _index_status[workspace_id].get("started", time.time()),
         }
 
-        # Compute SimHash for this workspace
-        _register_simhash(workspace_id, staging_dir)
-
         logger.info("Indexing complete for workspace %s: %s", workspace_id, result)
     except Exception as exc:
         logger.error("Indexing failed for workspace %s: %s", workspace_id, exc)
@@ -319,12 +306,10 @@ async def list_collections(request: Request) -> JSONResponse:
     for ws_id, staging in _upload_staging.items():
         col_name = ctx.get_collection_name(staging)
         status = _index_status.get(ws_id, {}).get("status", "unknown")
-        simhash = _simhash_registry.get(ws_id, {}).get("simhash", "")
         workspaces.append({
             "workspace_id": ws_id,
             "collection": col_name,
             "status": status,
-            "simhash": simhash,
             "has_index": col_name in collections,
         })
     return JSONResponse({"workspaces": workspaces})
@@ -342,119 +327,12 @@ async def clear(request: Request) -> JSONResponse:
     ctx = _get_ctx()
     await ctx.clear_index(staging_dir)
     _index_status.pop(workspace_id, None)
-    _simhash_registry.pop(workspace_id, None)
-    _save_simhash_registry()
 
     # Clean up staging directory
     shutil.rmtree(staging_dir, ignore_errors=True)
     _upload_staging.pop(workspace_id, None)
 
     return JSONResponse({"workspace_id": workspace_id, "status": "cleared"})
-
-
-async def simhash_lookup(request: Request) -> JSONResponse:
-    """Find the most similar existing index by SimHash.
-
-    Expects JSON body:
-    {
-        "simhash": "abc123...",
-        "threshold": 0.85
-    }
-
-    Returns the most similar workspace if similarity >= threshold,
-    enabling index reuse instead of re-indexing from scratch.
-    """
-    body = await request.json()
-    query_hash = body.get("simhash")
-    threshold = body.get("threshold", 0.85)
-
-    if not query_hash:
-        return JSONResponse({"error": "simhash required"}, status_code=400)
-
-    best_match = None
-    best_similarity = 0.0
-
-    for ws_id, entry in _simhash_registry.items():
-        sim = simhash_similarity(query_hash, entry["simhash"])
-        if sim > best_similarity:
-            best_similarity = sim
-            best_match = ws_id
-
-    if best_match and best_similarity >= threshold:
-        return JSONResponse({
-            "match": True,
-            "workspace_id": best_match,
-            "similarity": round(best_similarity, 4),
-            "collection": _simhash_registry[best_match].get("collection", ""),
-        })
-    else:
-        return JSONResponse({
-            "match": False,
-            "best_similarity": round(best_similarity, 4) if best_match else 0,
-        })
-
-
-async def register_simhash(request: Request) -> JSONResponse:
-    """Register a SimHash for a workspace (called by sync client)."""
-    body = await request.json()
-    workspace_id = body.get("workspace_id")
-    simhash = body.get("simhash")
-
-    if not workspace_id or not simhash:
-        return JSONResponse(
-            {"error": "workspace_id and simhash required"}, status_code=400
-        )
-
-    staging_dir = _upload_staging.get(workspace_id, "")
-    ctx = _get_ctx()
-    col_name = ctx.get_collection_name(staging_dir) if staging_dir else ""
-
-    _simhash_registry[workspace_id] = {
-        "simhash": simhash,
-        "collection": col_name,
-        "updated": time.time(),
-    }
-    _save_simhash_registry()
-
-    return JSONResponse({"workspace_id": workspace_id, "registered": True})
-
-
-# ---------------------------------------------------------------------------
-# SimHash registry persistence
-# ---------------------------------------------------------------------------
-
-def _register_simhash(workspace_id: str, staging_dir: str) -> None:
-    """Compute and register SimHash after indexing."""
-    from codecontext.core.simhash import compute_simhash_from_directory
-    from codecontext.core.types import DEFAULT_SUPPORTED_EXTENSIONS, DEFAULT_IGNORE_PATTERNS
-
-    ctx = _get_ctx()
-    simhash = compute_simhash_from_directory(
-        staging_dir, DEFAULT_SUPPORTED_EXTENSIONS, DEFAULT_IGNORE_PATTERNS
-    )
-    col_name = ctx.get_collection_name(staging_dir)
-    _simhash_registry[workspace_id] = {
-        "simhash": simhash,
-        "collection": col_name,
-        "updated": time.time(),
-    }
-    _save_simhash_registry()
-    logger.info("SimHash registered for %s: %s", workspace_id, simhash[:16])
-
-
-def _save_simhash_registry() -> None:
-    if _simhash_registry_path:
-        _simhash_registry_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(_simhash_registry_path, "w") as f:
-            json.dump(_simhash_registry, f, indent=2)
-
-
-def _load_simhash_registry() -> None:
-    global _simhash_registry
-    if _simhash_registry_path and _simhash_registry_path.exists():
-        with open(_simhash_registry_path) as f:
-            _simhash_registry = json.load(f)
-        logger.info("Loaded %d SimHash entries", len(_simhash_registry))
 
 
 # ---------------------------------------------------------------------------
@@ -564,8 +442,6 @@ async def clear_index(path: str) -> str:
     ctx = _get_ctx()
     await ctx.clear_index(staging_dir)
     _index_status.pop(workspace_id, None)
-    _simhash_registry.pop(workspace_id, None)
-    _save_simhash_registry()
     shutil.rmtree(staging_dir, ignore_errors=True)
     _upload_staging.pop(workspace_id, None)
 
@@ -625,10 +501,9 @@ def _workspace_id_from_path(path: str) -> str:
 
 def create_app(cfg: Config | None = None) -> Starlette:
     """Create the Starlette ASGI app for the index server."""
-    global _ctx, _cfg, _simhash_registry_path
+    global _ctx, _cfg
 
     _cfg = cfg or Config.from_env()
-    _simhash_registry_path = Path(_cfg.data_dir) / "simhash_registry.json"
 
     # Build context (same wiring as MCP server)
     emb_kwargs: dict = {"model": _cfg.embedding_model}
@@ -655,8 +530,6 @@ def create_app(cfg: Config | None = None) -> Starlette:
         vector_db=vector_db, splitter=splitter, config=_cfg, reranker=reranker
     )
 
-    _load_simhash_registry()
-
     routes = [
         Route("/api/upload", upload_files, methods=["POST"]),
         Route("/api/upload-json", upload_files_json, methods=["POST"]),
@@ -665,8 +538,6 @@ def create_app(cfg: Config | None = None) -> Starlette:
         Route("/api/status/{workspace_id}", get_status, methods=["GET"]),
         Route("/api/collections", list_collections, methods=["GET"]),
         Route("/api/clear/{workspace_id}", clear, methods=["DELETE"]),
-        Route("/api/simhash", simhash_lookup, methods=["POST"]),
-        Route("/api/simhash/register", register_simhash, methods=["POST"]),
     ]
 
     # Use MCP's Starlette app as the primary app (it manages the task group

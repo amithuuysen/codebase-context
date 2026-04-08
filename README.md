@@ -121,7 +121,7 @@ codecontext/
 │   ├── merkle.py                  # Merkle tree sync (directory-aware O(changes) diff)
 │   ├── path_obfuscation.py        # HMAC-SHA256 path segment encryption for privacy
 │   ├── reranker.py                # Cross-encoder reranker (optional Stage 2)
-│   ├── simhash.py                 # SimHash locality-sensitive hashing (team index sharing)
+│   ├── simhash.py                 # SimHash locality-sensitive hashing
 │   ├── sync.py                    # Flat file-hash sync (SHA-256 fallback)
 │   └── splitter/
 │       ├── __init__.py
@@ -136,7 +136,7 @@ codecontext/
 │   └── utils.py                   # ensure_absolute, truncate, log_config, shutdown
 ├── server/                        # Remote index server (HTTP API)
 │   ├── __init__.py
-│   └── index_server.py            # Starlette ASGI app — upload, index, search, SimHash
+│   └── index_server.py            # Starlette ASGI app — upload, index, search
 ├── client/                        # Client for remote index server
 │   ├── __init__.py
 │   ├── sync_client.py             # SyncClient — upload files, trigger indexing, search
@@ -321,18 +321,18 @@ MCP_TRANSPORT=stdio uv run codecontext
 
 ---
 
-### Mode B: Remote Index Server (Team Sharing)
+### Mode B: Remote Index Server
 
-Index server runs on a shared machine. Developers send files to it and search remotely — no local GPU needed on client machines.
+Index server runs on a separate machine. User sends files to it and searches remotely — no local GPU needed on the client.
 
 ```
-Developer A (local)              Index Server (remote :8878)       Developer B (local)
-┌──────────────────┐   files    ┌──────────────────────┐  files   ┌──────────────────┐
-│ VS Code + MCP    │───────────▶│ FAISS + BM25         │◀─────────│ VS Code + MCP    │
-│ codecontext      │   JSON     │ Ollama embedding     │  JSON    │ codecontext      │
-│ (proxy mode)     │◀───search──│ SimHash registry     │──search─▶│ (proxy mode)     │
-│                  │   results  │ Shared team indexes  │  results │                  │
-└──────────────────┘            └──────────────────────┘          └──────────────────┘
+Local Machine                    Index Server (remote :8878)
+┌──────────────────┐   files    ┌──────────────────────┐
+│ VS Code + MCP    │───────────▶│ FAISS + BM25         │
+│ codecontext      │   JSON     │ Ollama embedding     │
+│ (proxy mode)     │◀───search──│ Merkle tree sync     │
+│                  │   results  │                      │
+└──────────────────┘            └──────────────────────┘
 ```
 
 #### Step 1: Start the index server (on your shared/remote machine)
@@ -401,10 +401,6 @@ When `INDEX_SERVER_URL` is set, the MCP server becomes a thin proxy — it forwa
 
 > **No Ollama needed on client machines.** The index server handles all embedding and search. Clients only need `uv` and the `codecontext` package installed.
 
-#### SimHash Team Sharing
-
-When a developer uploads their codebase, the server computes a SimHash fingerprint and checks for similar existing indexes. If a teammate's index is 90%+ similar (e.g., same repo, different branch), the server reuses it — avoiding redundant re-indexing.
-
 #### Index Server API
 
 | Endpoint | Method | Description |
@@ -415,8 +411,6 @@ When a developer uploads their codebase, the server computes a SimHash fingerpri
 | `/api/status/{workspace_id}` | GET | Check indexing progress |
 | `/api/collections` | GET | List all indexed workspaces |
 | `/api/clear/{workspace_id}` | DELETE | Delete a workspace's index |
-| `/api/simhash` | POST | Find similar indexes by SimHash |
-| `/api/simhash/register` | POST | Register a workspace's SimHash fingerprint |
 
 ---
 

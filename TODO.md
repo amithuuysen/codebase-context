@@ -30,14 +30,7 @@
 - Use `gitpython` to walk recent commit history
 - Enable queries like "when was authentication last changed?"
 
-### 3. Team index sharing via SimHash (Hard)
-- Compute SimHash from Merkle tree root
-- Find similar existing indexes from teammates (92% avg overlap)
-- Copy existing index → diff only divergent files
-- Requires shared server/storage backend
-- Cursor reports: time-to-first-query drops from hours to seconds
-
-### 4. Custom embedding model (Hard)
+### 3. Custom embedding model (Hard)
 - Fine-tune embedding model on agent session traces
 - Use LLM-ranked relevance from real coding tasks as training signal
 - Requires: training data pipeline, GPU infrastructure

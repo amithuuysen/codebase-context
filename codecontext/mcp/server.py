@@ -126,11 +126,17 @@ async def index_codebase(
         client = SyncClient(server_url, abs_path)
         try:
             result = await client.sync(force=force)
+            if result.get("skipped"):
+                return (
+                    f"Codebase '{abs_path}' is already indexed on remote server.\n"
+                    f"Workspace ID: {result['workspace_id']}\n"
+                    f"Reason: {result.get('reason', 'unchanged')}\n"
+                    f"Use force=True to re-index."
+                )
             return (
                 f"Remote indexing started for '{abs_path}'.\n"
                 f"Workspace ID: {result['workspace_id']}\n"
                 f"Files uploaded: {result['files_uploaded']}\n"
-                f"SimHash: {result['simhash'][:16]}...\n"
                 f"Use get_indexing_status to check progress."
             )
         except Exception as exc:
@@ -201,6 +207,27 @@ async def search_code(
     if _remote_proxy:
         import hashlib as _hl
         workspace_id = os.path.basename(abs_path) + "_" + _hl.md5(abs_path.encode()).hexdigest()[:8]
+
+        # Check if indexed; if not, auto-upload and index first
+        try:
+            status = await _remote_proxy.get_status(workspace_id)
+        except Exception:
+            status = {"status": "not_found"}
+
+        if status.get("status") == "not_found":
+            # Auto-index: upload local files to remote server
+            from codecontext.client.sync_client import SyncClient
+            client = SyncClient(_remote_proxy.server_url, abs_path)
+            try:
+                sync_result = await client.sync()
+                if not sync_result.get("skipped"):
+                    # Wait for indexing to complete before searching
+                    await client.wait_for_indexing(poll_interval=3.0)
+            except Exception as exc:
+                return f"Error: Auto-index failed: {exc}"
+            finally:
+                await client.close()
+
         try:
             results = await _remote_proxy.search(workspace_id, query, top_k=limit)
         except Exception as exc:

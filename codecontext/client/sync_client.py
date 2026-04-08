@@ -2,12 +2,10 @@
 Sync Client — sends local files to a remote CodeContext index server.
 
 Flow:
-  1. Compute SimHash of local codebase
-  2. Check server for a similar existing index (SimHash lookup)
-  3. If similar index found → only send changed files (Merkle diff)
-  4. If no match → send all files
-  5. Trigger remote indexing
-  6. Search via server API
+  1. Check if already indexed on server
+  2. If not indexed or force → upload all files
+  3. Trigger remote indexing (server's Merkle tree skips unchanged files)
+  4. Search via server API
 
 Usage:
     client = SyncClient("http://index-server:8878", "/path/to/codebase")
@@ -19,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import os
 from pathlib import Path
@@ -27,7 +24,6 @@ from typing import Any
 
 import httpx
 
-from codecontext.core.simhash import compute_simhash_from_directory
 from codecontext.core.types import DEFAULT_IGNORE_PATTERNS, DEFAULT_SUPPORTED_EXTENSIONS
 
 logger = logging.getLogger("codecontext.client")
@@ -58,53 +54,57 @@ class SyncClient:
         return f"{name}_{h}"
 
     async def sync(self, force: bool = False) -> dict[str, Any]:
-        """Full sync: compute SimHash → check for similar index → upload files → index.
+        """Upload local files to remote server and trigger indexing.
+
+        Skips upload if already indexed (unless force=True).
+        Server's Merkle tree handles per-file diff during indexing.
 
         Args:
-            force: Force re-index even if a similar index exists.
+            force: Force re-index even if already indexed.
 
         Returns:
             Dict with sync results.
         """
         logger.info("Starting sync for %s → %s", self.codebase_path, self.server_url)
 
-        # Step 1: Compute local SimHash
-        logger.info("Computing SimHash...")
-        local_simhash = compute_simhash_from_directory(
-            self.codebase_path, self.extensions, self.ignore_patterns
-        )
-        logger.info("Local SimHash: %s", local_simhash[:16])
+        # Step 1: Check if already indexed on server
+        remote_status = await self.get_status()
+        already_indexed = remote_status.get("status") == "indexed"
 
-        # Step 2: Check server for similar index
-        similar = await self._find_similar_index(local_simhash)
-        if similar and not force:
-            logger.info(
-                "Found similar index: workspace=%s, similarity=%.1f%%",
-                similar["workspace_id"],
-                similar["similarity"] * 100,
-            )
-            # Could optimize: only send divergent files
-            # For now, still send all and let server handle diff
+        if already_indexed and not force:
+            logger.info("Codebase already indexed on server. Skipping upload.")
+            return {
+                "workspace_id": self.workspace_id,
+                "files_uploaded": 0,
+                "skipped": True,
+                "reason": "Already indexed on server — use force=True to re-index",
+                "index_status": remote_status,
+            }
 
-        # Step 3: Collect and upload files
+        if remote_status.get("status") == "indexing":
+            logger.info("Codebase is currently being indexed. Skipping upload.")
+            return {
+                "workspace_id": self.workspace_id,
+                "files_uploaded": 0,
+                "skipped": True,
+                "reason": "Indexing already in progress",
+                "index_status": remote_status,
+            }
+
+        # Step 2: Collect and upload files
         files = self._collect_files()
         logger.info("Uploading %d files to server...", len(files))
-
         upload_result = await self._upload_files(files)
         logger.info("Upload complete: %s", upload_result)
 
-        # Step 4: Register SimHash
-        await self._register_simhash(local_simhash)
-
-        # Step 5: Trigger indexing
+        # Step 3: Trigger indexing
         index_result = await self._trigger_index(force)
         logger.info("Indexing triggered: %s", index_result)
 
         return {
             "workspace_id": self.workspace_id,
             "files_uploaded": len(files),
-            "simhash": local_simhash,
-            "similar_index": similar,
+            "skipped": False,
             "index_status": index_result,
         }
 
@@ -227,34 +227,6 @@ class SyncClient:
             logger.info("Uploaded batch: %d/%d files", total, len(files))
 
         return {"total_uploaded": total}
-
-    async def _find_similar_index(self, simhash: str) -> dict[str, Any] | None:
-        """Check server for a similar existing index."""
-        try:
-            resp = await self._client.post(
-                f"{self.server_url}/api/simhash",
-                json={"simhash": simhash, "threshold": 0.85},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get("match"):
-                return data
-        except Exception as exc:
-            logger.debug("SimHash lookup failed: %s", exc)
-        return None
-
-    async def _register_simhash(self, simhash: str) -> None:
-        """Register local SimHash with the server."""
-        try:
-            await self._client.post(
-                f"{self.server_url}/api/simhash/register",
-                json={
-                    "workspace_id": self.workspace_id,
-                    "simhash": simhash,
-                },
-            )
-        except Exception as exc:
-            logger.debug("SimHash registration failed: %s", exc)
 
     async def _trigger_index(self, force: bool = False) -> dict[str, Any]:
         """Trigger indexing on the server."""
