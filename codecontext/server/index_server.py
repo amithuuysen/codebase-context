@@ -459,7 +459,7 @@ def _load_simhash_registry() -> None:
 # MCP tools — exposed at /mcp so VS Code can connect directly
 # ---------------------------------------------------------------------------
 
-_mcp = FastMCP("codecontext-server")
+_mcp = FastMCP("codecontext-server", streamable_http_path="/")
 
 
 @_mcp.tool(description="Index a codebase directory to enable semantic code search.")
