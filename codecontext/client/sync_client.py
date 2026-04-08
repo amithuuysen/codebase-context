@@ -206,27 +206,39 @@ class SyncClient:
         return files
 
     async def _upload_files(self, files: dict[str, str]) -> dict[str, Any]:
-        """Upload files to server in batches (JSON endpoint)."""
+        """Upload files to server in parallel batches (JSON endpoint)."""
         batch_size = 100  # files per request
-        total = 0
+        max_concurrent = 4  # parallel uploads
 
         rel_paths = list(files.keys())
+        batches = []
         for i in range(0, len(rel_paths), batch_size):
             batch_paths = rel_paths[i:i + batch_size]
-            batch = {p: files[p] for p in batch_paths}
+            batches.append({p: files[p] for p in batch_paths})
 
-            resp = await self._client.post(
-                f"{self.server_url}/api/upload-json",
-                json={
-                    "workspace_id": self.workspace_id,
-                    "files": batch,
-                },
-            )
-            resp.raise_for_status()
-            total += len(batch)
-            logger.info("Uploaded batch: %d/%d files", total, len(files))
+        sem = asyncio.Semaphore(max_concurrent)
+        total_uploaded = 0
+        total_files = len(files)
+        lock = asyncio.Lock()
 
-        return {"total_uploaded": total}
+        async def upload_batch(batch: dict[str, str]) -> None:
+            nonlocal total_uploaded
+            async with sem:
+                resp = await self._client.post(
+                    f"{self.server_url}/api/upload-json",
+                    json={
+                        "workspace_id": self.workspace_id,
+                        "files": batch,
+                    },
+                )
+                resp.raise_for_status()
+                async with lock:
+                    total_uploaded += len(batch)
+                    logger.info("Uploaded: %d/%d files", total_uploaded, total_files)
+
+        await asyncio.gather(*[upload_batch(b) for b in batches])
+
+        return {"total_uploaded": total_uploaded}
 
     async def _trigger_index(self, force: bool = False) -> dict[str, Any]:
         """Trigger indexing on the server."""

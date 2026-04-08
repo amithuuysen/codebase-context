@@ -353,16 +353,28 @@ async def index_codebase(
     path: str,
     force: bool = False,
 ) -> str:
-    """Index a codebase. Upload files first via SyncClient, then call this.
+    """Index a codebase directory or previously uploaded workspace.
 
     Args:
-        path: Workspace ID or codebase path to index.
+        path: Absolute path to a codebase directory on the server, or a workspace ID.
         force: Force re-indexing even if already indexed.
     """
     workspace_id = _workspace_id_from_path(path)
+
+    # Check for uploaded staging files first
     staging_dir = _upload_staging.get(workspace_id)
+
+    # If no staged files, check if path is a directory on this server's filesystem
+    if (not staging_dir or not os.path.isdir(staging_dir)) and os.path.isdir(path):
+        staging_dir = os.path.abspath(path)
+        _upload_staging[workspace_id] = staging_dir
+
     if not staging_dir or not os.path.isdir(staging_dir):
-        return f"Error: No staged files for workspace '{workspace_id}'. Upload files first via /api/upload-json."
+        return (
+            f"Error: No staged files for workspace '{workspace_id}' and "
+            f"'{path}' is not a directory on this server. "
+            f"Either provide a valid server path or upload files first via /api/upload-json."
+        )
 
     status = _index_status.get(workspace_id, {})
     if status.get("status") == "indexing":
@@ -378,7 +390,7 @@ async def index_codebase(
         _background_index(workspace_id, staging_dir, force)
     )
 
-    return f"Indexing started for workspace '{workspace_id}'. Use get_indexing_status to check progress."
+    return f"Indexing started for workspace '{workspace_id}' from '{staging_dir}'. Use get_indexing_status to check progress."
 
 
 @_mcp.tool(description="Search indexed codebase using natural language queries. Returns relevant code snippets ranked by similarity.")
@@ -399,8 +411,14 @@ async def search_code(
 
     workspace_id = _workspace_id_from_path(path)
     staging_dir = _upload_staging.get(workspace_id)
+
+    # If no staged files, check if path exists on this server's filesystem
+    if not staging_dir and os.path.isdir(path):
+        staging_dir = os.path.abspath(path)
+        _upload_staging[workspace_id] = staging_dir
+
     if not staging_dir:
-        return f"Error: Workspace '{workspace_id}' not found. Upload and index files first."
+        return f"Error: Workspace '{workspace_id}' not found. Provide a valid server path or upload files first."
 
     limit = min(limit, 50)
     ctx = _get_ctx()
@@ -436,13 +454,17 @@ async def clear_index(path: str) -> str:
     """
     workspace_id = _workspace_id_from_path(path)
     staging_dir = _upload_staging.get(workspace_id)
+
+    # Also check if path is a directory on this server
+    if not staging_dir and os.path.isdir(path):
+        staging_dir = os.path.abspath(path)
+
     if not staging_dir:
         return f"Error: Workspace '{workspace_id}' not found."
 
     ctx = _get_ctx()
     await ctx.clear_index(staging_dir)
     _index_status.pop(workspace_id, None)
-    shutil.rmtree(staging_dir, ignore_errors=True)
     _upload_staging.pop(workspace_id, None)
 
     return f"Successfully cleared index for workspace '{workspace_id}'."
