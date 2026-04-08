@@ -36,10 +36,103 @@ logger = logging.getLogger("codecontext")
 # to a remote index server instead of local FAISS.
 _remote_proxy = None  # RemoteSearchProxy | None
 
+# Background remote indexing tasks: {abs_path: {"status": str, "phase": str, "progress": int, ...}}
+_remote_tasks: dict[str, dict] = {}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+async def _background_remote_index(abs_path: str, force: bool = False) -> None:
+    """Background task: upload local files to remote server, trigger indexing, track progress."""
+    from codecontext.client.sync_client import SyncClient
+
+    task = _remote_tasks[abs_path]
+    workspace_id = task["workspace_id"]
+    client = SyncClient(_remote_proxy.server_url, abs_path)
+
+    try:
+        # Phase 1: Upload
+        task.update({"phase": "uploading", "progress": 0})
+        logger.info("Remote index [%s]: uploading files...", workspace_id)
+
+        files = client._collect_files()
+        total_files = len(files)
+        task["total_files"] = total_files
+
+        if total_files == 0:
+            task.update({"status": "failed", "phase": "upload", "error": "No files found to index"})
+            return
+
+        # Upload in parallel batches, track progress
+        batch_size = 100
+        max_concurrent = 4
+        rel_paths = list(files.keys())
+        batches = []
+        for i in range(0, len(rel_paths), batch_size):
+            batch_paths = rel_paths[i:i + batch_size]
+            batches.append({p: files[p] for p in batch_paths})
+
+        sem = asyncio.Semaphore(max_concurrent)
+        uploaded = 0
+
+        async def upload_batch(batch: dict[str, str]) -> None:
+            nonlocal uploaded
+            async with sem:
+                resp = await client._client.post(
+                    f"{client.server_url}/api/upload-json",
+                    json={"workspace_id": workspace_id, "files": batch},
+                )
+                resp.raise_for_status()
+                uploaded += len(batch)
+                pct = int(uploaded / total_files * 50)  # Upload = 0-50%
+                task.update({"progress": pct, "files_uploaded": uploaded})
+
+        await asyncio.gather(*[upload_batch(b) for b in batches])
+        logger.info("Remote index [%s]: %d files uploaded", workspace_id, uploaded)
+
+        # Phase 2: Trigger indexing
+        task.update({"phase": "indexing", "progress": 50})
+        resp = await client._client.post(
+            f"{client.server_url}/api/index",
+            json={"workspace_id": workspace_id, "force": force},
+        )
+        resp.raise_for_status()
+
+        # Phase 3: Poll remote server for indexing progress
+        while True:
+            await asyncio.sleep(3.0)
+            try:
+                status = await _remote_proxy.get_status(workspace_id)
+            except Exception:
+                continue
+            s = status.get("status", "unknown")
+            if s == "indexed":
+                task.update({"status": "indexed", "phase": "done", "progress": 100})
+                logger.info("Remote index [%s]: complete", workspace_id)
+                return
+            elif s == "failed":
+                task.update({"status": "failed", "phase": "indexing", "error": status.get("error", "unknown")})
+                logger.error("Remote index [%s]: failed — %s", workspace_id, status.get("error"))
+                return
+            elif s == "indexing":
+                remote_pct = status.get("progress", 0)
+                # Map remote 0-100% to our 50-100% range
+                pct = 50 + int(remote_pct / 2)
+                task.update({"progress": pct, "remote_progress": remote_pct, "remote_phase": status.get("phase", "")})
+    except Exception as exc:
+        logger.error("Remote index [%s]: error — %s", workspace_id, exc)
+        task.update({"status": "failed", "error": str(exc)})
+    finally:
+        await client.close()
+
+
+def _workspace_id_for_path(abs_path: str) -> str:
+    """Derive workspace_id from an absolute path (matches SyncClient logic)."""
+    import hashlib as _hl
+    return os.path.basename(abs_path) + "_" + _hl.md5(abs_path.encode()).hexdigest()[:8]
+
 
 def _build_context(cfg: Config) -> Context:
     """Wire up embedding → FAISS vector DB → BM25 → splitter → reranker → Context."""
@@ -121,28 +214,51 @@ async def index_codebase(
 
     # --- Remote proxy mode: upload files to index server ---
     if _remote_proxy:
-        from codecontext.client.sync_client import SyncClient
-        server_url = _remote_proxy.server_url
-        client = SyncClient(server_url, abs_path)
-        try:
-            result = await client.sync(force=force)
-            if result.get("skipped"):
-                return (
-                    f"Codebase '{abs_path}' is already indexed on remote server.\n"
-                    f"Workspace ID: {result['workspace_id']}\n"
-                    f"Reason: {result.get('reason', 'unchanged')}\n"
-                    f"Use force=True to re-index."
-                )
+        workspace_id = _workspace_id_for_path(abs_path)
+
+        # Already running?
+        existing = _remote_tasks.get(abs_path)
+        if existing and existing.get("status") == "indexing":
             return (
-                f"Remote indexing started for '{abs_path}'.\n"
-                f"Workspace ID: {result['workspace_id']}\n"
-                f"Files uploaded: {result['files_uploaded']}\n"
+                f"Codebase '{abs_path}' is already being indexed.\n"
+                f"Workspace ID: {workspace_id}\n"
+                f"Phase: {existing.get('phase', 'unknown')}\n"
+                f"Progress: {existing.get('progress', 0)}%\n"
                 f"Use get_indexing_status to check progress."
             )
-        except Exception as exc:
-            return f"Error: Remote sync failed: {exc}"
-        finally:
-            await client.close()
+
+        # Already indexed on remote? (skip unless force)
+        if not force:
+            try:
+                status = await _remote_proxy.get_status(workspace_id)
+                if status.get("status") == "indexed":
+                    return (
+                        f"Codebase '{abs_path}' is already indexed on remote server.\n"
+                        f"Workspace ID: {workspace_id}\n"
+                        f"Use force=True to re-index."
+                    )
+            except Exception:
+                pass
+
+        # Launch background upload + index
+        _remote_tasks[abs_path] = {
+            "status": "indexing",
+            "workspace_id": workspace_id,
+            "phase": "starting",
+            "progress": 0,
+            "files_uploaded": 0,
+            "total_files": 0,
+        }
+        asyncio.get_event_loop().create_task(
+            _background_remote_index(abs_path, force)
+        )
+
+        return (
+            f"Remote indexing initiated for '{abs_path}'.\n"
+            f"Workspace ID: {workspace_id}\n"
+            f"Files are being uploaded and indexed in the background.\n"
+            f"Use get_indexing_status to check progress."
+        )
 
     # --- Local mode ---
     # Guard: already indexing?
@@ -205,28 +321,51 @@ async def search_code(
 
     # --- Remote proxy mode: forward search to index server ---
     if _remote_proxy:
-        import hashlib as _hl
-        workspace_id = os.path.basename(abs_path) + "_" + _hl.md5(abs_path.encode()).hexdigest()[:8]
+        workspace_id = _workspace_id_for_path(abs_path)
 
-        # Check if indexed; if not, auto-upload and index first
+        # Check if currently uploading/indexing locally
+        local_task = _remote_tasks.get(abs_path)
+        if local_task and local_task.get("status") == "indexing":
+            phase = local_task.get("phase", "unknown")
+            pct = local_task.get("progress", 0)
+            return (
+                f"Codebase '{abs_path}' is still being indexed.\n"
+                f"Phase: {phase} ({pct}% complete)\n"
+                f"Use get_indexing_status to check progress. Search will be available once indexing completes."
+            )
+
+        # Check remote status
         try:
             status = await _remote_proxy.get_status(workspace_id)
         except Exception:
             status = {"status": "not_found"}
 
         if status.get("status") == "not_found":
-            # Auto-index: upload local files to remote server
-            from codecontext.client.sync_client import SyncClient
-            client = SyncClient(_remote_proxy.server_url, abs_path)
-            try:
-                sync_result = await client.sync()
-                if not sync_result.get("skipped"):
-                    # Wait for indexing to complete before searching
-                    await client.wait_for_indexing(poll_interval=3.0)
-            except Exception as exc:
-                return f"Error: Auto-index failed: {exc}"
-            finally:
-                await client.close()
+            # Kick off background indexing, don't wait
+            _remote_tasks[abs_path] = {
+                "status": "indexing",
+                "workspace_id": workspace_id,
+                "phase": "starting",
+                "progress": 0,
+                "files_uploaded": 0,
+                "total_files": 0,
+            }
+            asyncio.get_event_loop().create_task(
+                _background_remote_index(abs_path, False)
+            )
+            return (
+                f"Codebase '{abs_path}' is not yet indexed on the remote server.\n"
+                f"Indexing has been initiated in the background.\n"
+                f"Workspace ID: {workspace_id}\n"
+                f"Use get_indexing_status to check progress, then search again once complete."
+            )
+
+        if status.get("status") == "indexing":
+            return (
+                f"Codebase '{abs_path}' is currently being indexed on the remote server.\n"
+                f"Progress: {status.get('progress', 0)}%\n"
+                f"Use get_indexing_status to check progress. Search will be available once indexing completes."
+            )
 
         try:
             results = await _remote_proxy.search(workspace_id, query, top_k=limit)
@@ -318,8 +457,9 @@ async def clear_index(path: str) -> str:
 
     # --- Remote proxy mode ---
     if _remote_proxy:
-        import hashlib as _hl
-        workspace_id = os.path.basename(abs_path) + "_" + _hl.md5(abs_path.encode()).hexdigest()[:8]
+        workspace_id = _workspace_id_for_path(abs_path)
+        # Cancel local background task if running
+        _remote_tasks.pop(abs_path, None)
         try:
             import httpx
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -357,15 +497,65 @@ async def get_indexing_status(path: str) -> str:
 
     # --- Remote proxy mode ---
     if _remote_proxy:
-        try:
-            status = await _remote_proxy.get_status(
-                os.path.basename(abs_path) + "_" + __import__("hashlib").md5(abs_path.encode()).hexdigest()[:8]
-            )
+        workspace_id = _workspace_id_for_path(abs_path)
+
+        # Check local background task first
+        local_task = _remote_tasks.get(abs_path)
+        if local_task and local_task.get("status") == "indexing":
+            phase = local_task.get("phase", "unknown")
+            pct = local_task.get("progress", 0)
+            uploaded = local_task.get("files_uploaded", 0)
+            total = local_task.get("total_files", 0)
+            lines = [
+                f"**Codebase:** {abs_path}",
+                f"**Workspace ID:** {workspace_id}",
+                f"**Status:** Indexing 🔄",
+                f"**Phase:** {phase}",
+                f"**Overall progress:** {pct}%",
+            ]
+            if phase == "uploading":
+                lines.append(f"**Files uploaded:** {uploaded}/{total}")
+            elif phase == "indexing":
+                remote_pct = local_task.get("remote_progress", 0)
+                remote_phase = local_task.get("remote_phase", "")
+                lines.append(f"**Remote indexing:** {remote_pct}%")
+                if remote_phase:
+                    lines.append(f"**Remote phase:** {remote_phase}")
+            return "\n".join(lines)
+
+        if local_task and local_task.get("status") == "failed":
             return (
                 f"**Codebase:** {abs_path}\n"
-                f"**Status:** {status.get('status', 'unknown')}\n"
-                f"**Progress:** {status.get('progress', 0)}%"
+                f"**Workspace ID:** {workspace_id}\n"
+                f"**Status:** Failed ❌\n"
+                f"**Error:** {local_task.get('error', 'unknown')}"
             )
+
+        if local_task and local_task.get("status") == "indexed":
+            return (
+                f"**Codebase:** {abs_path}\n"
+                f"**Workspace ID:** {workspace_id}\n"
+                f"**Status:** Indexed ✅\n"
+                f"**Progress:** 100%\n"
+                f"Ready for search."
+            )
+
+        # Fall back to remote server status
+        try:
+            status = await _remote_proxy.get_status(workspace_id)
+            s = status.get("status", "unknown")
+            lines = [
+                f"**Codebase:** {abs_path}",
+                f"**Workspace ID:** {workspace_id}",
+                f"**Status:** {s}",
+            ]
+            if s == "indexing":
+                lines.append(f"**Progress:** {status.get('progress', 0)}%")
+                if status.get("phase"):
+                    lines.append(f"**Phase:** {status['phase']}")
+            elif s == "indexed":
+                lines.append("Ready for search.")
+            return "\n".join(lines)
         except Exception as exc:
             return f"Error: {exc}"
 

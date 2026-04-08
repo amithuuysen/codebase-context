@@ -420,6 +420,36 @@ async def search_code(
     if not staging_dir:
         return f"Error: Workspace '{workspace_id}' not found. Provide a valid server path or upload files first."
 
+    # Check indexing status
+    status = _index_status.get(workspace_id, {})
+    if status.get("status") == "indexing":
+        pct = status.get("progress", 0)
+        phase = status.get("phase", "unknown")
+        return (
+            f"Workspace '{workspace_id}' is still being indexed ({pct}% — {phase}).\n"
+            f"Use get_indexing_status to check progress. Search will be available once indexing completes."
+        )
+    if status.get("status") == "failed":
+        return (
+            f"Workspace '{workspace_id}' indexing failed: {status.get('error', 'unknown')}.\n"
+            f"Use index_codebase to retry."
+        )
+    if status.get("status") not in ("indexed",):
+        # Not indexed yet — auto-trigger indexing
+        _upload_staging[workspace_id] = staging_dir
+        _index_status[workspace_id] = {
+            "status": "indexing",
+            "progress": 0,
+            "started": time.time(),
+        }
+        asyncio.get_event_loop().create_task(
+            _background_index(workspace_id, staging_dir, False)
+        )
+        return (
+            f"Workspace '{workspace_id}' was not indexed. Indexing has been initiated.\n"
+            f"Use get_indexing_status to check progress, then search again once complete."
+        )
+
     limit = min(limit, 50)
     ctx = _get_ctx()
     try:
