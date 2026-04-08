@@ -119,6 +119,26 @@ async def index_codebase(
     if not os.path.isdir(abs_path):
         return f"Error: '{abs_path}' is not a directory."
 
+    # --- Remote proxy mode: upload files to index server ---
+    if _remote_proxy:
+        from codecontext.client.sync_client import SyncClient
+        server_url = _remote_proxy.server_url
+        client = SyncClient(server_url, abs_path)
+        try:
+            result = await client.sync(force=force)
+            return (
+                f"Remote indexing started for '{abs_path}'.\n"
+                f"Workspace ID: {result['workspace_id']}\n"
+                f"Files uploaded: {result['files_uploaded']}\n"
+                f"SimHash: {result['simhash'][:16]}...\n"
+                f"Use get_indexing_status to check progress."
+            )
+        except Exception as exc:
+            return f"Error: Remote sync failed: {exc}"
+        finally:
+            await client.close()
+
+    # --- Local mode ---
     # Guard: already indexing?
     if abs_path in _snap.get_indexing_codebases():
         pct = _snap.get_indexing_progress(abs_path)
@@ -269,6 +289,22 @@ async def clear_index(path: str) -> str:
         return "Error: 'path' is required."
     abs_path = ensure_absolute(path)
 
+    # --- Remote proxy mode ---
+    if _remote_proxy:
+        import hashlib as _hl
+        workspace_id = os.path.basename(abs_path) + "_" + _hl.md5(abs_path.encode()).hexdigest()[:8]
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.delete(f"{_remote_proxy.server_url}/api/clear/{workspace_id}")
+                if resp.status_code == 404:
+                    return f"Workspace '{workspace_id}' not found on remote server."
+                resp.raise_for_status()
+            return f"Successfully cleared remote index for '{abs_path}'."
+        except Exception as exc:
+            return f"Error: {exc}"
+
+    # --- Local mode ---
     status = _snap.get_codebase_status(abs_path)
     if status == "not_found":
         has = await _ctx.has_index(abs_path)
@@ -292,6 +328,21 @@ async def get_indexing_status(path: str) -> str:
         return "Error: 'path' is required."
     abs_path = ensure_absolute(path)
 
+    # --- Remote proxy mode ---
+    if _remote_proxy:
+        try:
+            status = await _remote_proxy.get_status(
+                os.path.basename(abs_path) + "_" + __import__("hashlib").md5(abs_path.encode()).hexdigest()[:8]
+            )
+            return (
+                f"**Codebase:** {abs_path}\n"
+                f"**Status:** {status.get('status', 'unknown')}\n"
+                f"**Progress:** {status.get('progress', 0)}%"
+            )
+        except Exception as exc:
+            return f"Error: {exc}"
+
+    # --- Local mode ---
     status = _snap.get_codebase_status(abs_path)
     info = _snap.get_codebase_info(abs_path)
 
@@ -351,17 +402,19 @@ def main() -> None:
     cfg = Config.from_env()
     log_config(cfg)
 
-    _ctx = _build_context(cfg)
-    _snap = SnapshotManager()
-    _snap.load_snapshot()
-    _sync = SyncManager(_ctx, _snap)
-
-    # Remote proxy mode: forward searches to a shared index server
+    # Remote proxy mode: skip local Ollama/FAISS entirely
     index_server_url = os.getenv("INDEX_SERVER_URL")
     if index_server_url:
         from codecontext.client.remote_search import RemoteSearchProxy
         _remote_proxy = RemoteSearchProxy(index_server_url)
-        logger.info("Remote proxy mode: searches forwarded to %s", index_server_url)
+        _snap = SnapshotManager()
+        _snap.load_snapshot()
+        logger.info("Remote proxy mode: all operations forwarded to %s", index_server_url)
+    else:
+        _ctx = _build_context(cfg)
+        _snap = SnapshotManager()
+        _snap.load_snapshot()
+        _sync = SyncManager(_ctx, _snap)
 
     install_shutdown_handlers()
 
