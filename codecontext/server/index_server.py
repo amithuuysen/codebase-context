@@ -28,12 +28,14 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
+
+from mcp.server.fastmcp import FastMCP
 
 from codecontext.core.context import Context
 from codecontext.core.embedding import create_embedding
@@ -454,6 +456,162 @@ def _load_simhash_registry() -> None:
 
 
 # ---------------------------------------------------------------------------
+# MCP tools — exposed at /mcp so VS Code can connect directly
+# ---------------------------------------------------------------------------
+
+_mcp = FastMCP("codecontext-server")
+
+
+@_mcp.tool(description="Index a codebase directory to enable semantic code search.")
+async def index_codebase(
+    path: str,
+    force: bool = False,
+) -> str:
+    """Index a codebase. Upload files first via SyncClient, then call this.
+
+    Args:
+        path: Workspace ID or codebase path to index.
+        force: Force re-indexing even if already indexed.
+    """
+    workspace_id = _workspace_id_from_path(path)
+    staging_dir = _upload_staging.get(workspace_id)
+    if not staging_dir or not os.path.isdir(staging_dir):
+        return f"Error: No staged files for workspace '{workspace_id}'. Upload files first via /api/upload-json."
+
+    status = _index_status.get(workspace_id, {})
+    if status.get("status") == "indexing":
+        return f"Workspace '{workspace_id}' is already being indexed ({status.get('progress', 0)}% complete)."
+
+    _index_status[workspace_id] = {
+        "status": "indexing",
+        "progress": 0,
+        "started": time.time(),
+    }
+
+    asyncio.get_event_loop().create_task(
+        _background_index(workspace_id, staging_dir, force)
+    )
+
+    return f"Indexing started for workspace '{workspace_id}'. Use get_indexing_status to check progress."
+
+
+@_mcp.tool(description="Search indexed codebase using natural language queries. Returns relevant code snippets ranked by similarity.")
+async def search_code(
+    path: str,
+    query: str,
+    limit: int = 10,
+) -> str:
+    """Search an indexed codebase using natural language.
+
+    Args:
+        path: Workspace ID or codebase path to search.
+        query: Natural language search query.
+        limit: Max results to return (default 10, max 50).
+    """
+    if not query:
+        return "Error: 'query' is required."
+
+    workspace_id = _workspace_id_from_path(path)
+    staging_dir = _upload_staging.get(workspace_id)
+    if not staging_dir:
+        return f"Error: Workspace '{workspace_id}' not found. Upload and index files first."
+
+    limit = min(limit, 50)
+    ctx = _get_ctx()
+    try:
+        results = await ctx.semantic_search(
+            staging_dir, query, top_k=limit, threshold=0.5
+        )
+    except Exception as exc:
+        return f"Error: Search failed: {exc}"
+
+    if not results:
+        return f'No results found for query: "{query}" in workspace \'{workspace_id}\''
+
+    lines: list[str] = []
+    lines.append(f'Found {len(results)} results for query: "{query}"\n')
+    for i, r in enumerate(results, 1):
+        loc = f"{r.relative_path}:{r.start_line}-{r.end_line}"
+        lines.append(
+            f"{i}. Code snippet ({r.language})\n"
+            f"   Location: {loc}\n"
+            f"   Rank: {i}\n"
+            f"   Context:\n```{r.language}\n{r.content}\n```\n"
+        )
+    return "\n".join(lines)
+
+
+@_mcp.tool(description="Clear the search index for a workspace.")
+async def clear_index(path: str) -> str:
+    """Clear the search index for a workspace.
+
+    Args:
+        path: Workspace ID or codebase path to clear.
+    """
+    workspace_id = _workspace_id_from_path(path)
+    staging_dir = _upload_staging.get(workspace_id)
+    if not staging_dir:
+        return f"Error: Workspace '{workspace_id}' not found."
+
+    ctx = _get_ctx()
+    await ctx.clear_index(staging_dir)
+    _index_status.pop(workspace_id, None)
+    _simhash_registry.pop(workspace_id, None)
+    _save_simhash_registry()
+    shutil.rmtree(staging_dir, ignore_errors=True)
+    _upload_staging.pop(workspace_id, None)
+
+    return f"Successfully cleared index for workspace '{workspace_id}'."
+
+
+@_mcp.tool(description="Get indexing status and progress for a workspace.")
+async def get_indexing_status(path: str) -> str:
+    """Get indexing status for a workspace.
+
+    Args:
+        path: Workspace ID or codebase path to check.
+    """
+    workspace_id = _workspace_id_from_path(path)
+    status = _index_status.get(workspace_id)
+    if not status:
+        return f"Workspace '{workspace_id}' is not indexed."
+
+    s = status.get("status", "unknown")
+    if s == "indexed":
+        result = status.get("result", {})
+        return (
+            f"**Workspace:** {workspace_id}\n"
+            f"**Status:** Indexed\n"
+            f"**Result:** {result}"
+        )
+    elif s == "indexing":
+        return (
+            f"**Workspace:** {workspace_id}\n"
+            f"**Status:** Indexing\n"
+            f"**Progress:** {status.get('progress', 0)}%\n"
+            f"**Phase:** {status.get('phase', 'unknown')}"
+        )
+    elif s == "failed":
+        return (
+            f"**Workspace:** {workspace_id}\n"
+            f"**Status:** Failed\n"
+            f"**Error:** {status.get('error', 'unknown')}"
+        )
+    return f"Workspace '{workspace_id}' status: {s}"
+
+
+def _workspace_id_from_path(path: str) -> str:
+    """Convert a path to a workspace_id, or return as-is if already an ID."""
+    # If it looks like a workspace_id already (no slashes), return as-is
+    if "/" not in path and "\\" not in path:
+        return path
+    # Otherwise derive from path like the MCP proxy does
+    base = os.path.basename(path.rstrip("/\\"))
+    h = hashlib.md5(path.encode()).hexdigest()[:8]
+    return f"{base}_{h}"
+
+
+# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
@@ -504,7 +662,12 @@ def create_app(cfg: Config | None = None) -> Starlette:
     ]
 
     app = Starlette(routes=routes)
-    logger.info("Index server initialized with %d routes", len(routes))
+
+    # Mount MCP server at /mcp for direct VS Code connection
+    mcp_app = _mcp.streamable_http_app()
+    app.mount("/mcp", mcp_app)
+
+    logger.info("Index server initialized with %d routes + MCP at /mcp", len(routes))
     return app
 
 

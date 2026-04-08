@@ -78,9 +78,9 @@ mcp = FastMCP(
 )
 
 # Module-level state filled in by main() before the server starts
-_ctx: Context
+_ctx: Context | None = None
 _snap: SnapshotManager
-_sync: SyncManager
+_sync: SyncManager | None = None
 
 
 # ---------------------------------------------------------------------------
