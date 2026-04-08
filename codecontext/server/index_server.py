@@ -459,7 +459,7 @@ def _load_simhash_registry() -> None:
 # MCP tools — exposed at /mcp so VS Code can connect directly
 # ---------------------------------------------------------------------------
 
-_mcp = FastMCP("codecontext-server", streamable_http_path="/")
+_mcp = FastMCP("codecontext-server", streamable_http_path="/mcp")
 
 
 @_mcp.tool(description="Index a codebase directory to enable semantic code search.")
@@ -661,13 +661,13 @@ def create_app(cfg: Config | None = None) -> Starlette:
         Route("/api/simhash/register", register_simhash, methods=["POST"]),
     ]
 
-    app = Starlette(routes=routes)
+    # Use MCP's Starlette app as the primary app (it manages the task group
+    # lifecycle via its lifespan), then prepend the REST API routes.
+    app = _mcp.streamable_http_app()
+    for route in reversed(routes):
+        app.routes.insert(0, route)
 
-    # Mount MCP server at /mcp for direct VS Code connection
-    mcp_app = _mcp.streamable_http_app()
-    app.mount("/mcp", mcp_app)
-
-    logger.info("Index server initialized with %d routes + MCP at /mcp", len(routes))
+    logger.info("Index server initialized with %d REST routes + MCP at /mcp", len(routes))
     return app
 
 
