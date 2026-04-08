@@ -37,6 +37,8 @@ from starlette.routing import Route
 
 from mcp.server.fastmcp import FastMCP
 
+from mcp.server.transport_security import TransportSecuritySettings
+
 from codecontext.core.context import Context
 from codecontext.core.embedding import create_embedding
 from codecontext.core.reranker import Reranker
@@ -459,7 +461,13 @@ def _load_simhash_registry() -> None:
 # MCP tools — exposed at /mcp so VS Code can connect directly
 # ---------------------------------------------------------------------------
 
-_mcp = FastMCP("codecontext-server", streamable_http_path="/mcp")
+_mcp = FastMCP(
+    "codecontext-server",
+    streamable_http_path="/mcp",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+    ),
+)
 
 
 @_mcp.tool(description="Index a codebase directory to enable semantic code search.")
