@@ -62,7 +62,7 @@ USAGE
 
 ENVIRONMENT VARIABLES
   MCP_TRANSPORT        streamable-http | stdio | sse  (default: streamable-http)
-  EMBEDDING_PROVIDER   openai | ollama | local   (default: openai)
+  EMBEDDING_PROVIDER   openai | ollama | local   (default: ollama)
   EMBEDDING_MODEL      Model name (default: text-embedding-3-small)
   OPENAI_API_KEY       Required for OpenAI provider
   OPENAI_BASE_URL      Optional custom base URL

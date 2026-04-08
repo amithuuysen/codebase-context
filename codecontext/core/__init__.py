@@ -25,6 +25,7 @@ from .hybrid_search import HybridSearcher, reciprocal_rank_fusion
 from .merkle import MerkleSynchronizer
 from .path_obfuscation import PathObfuscator
 from .reranker import Reranker
+from .simhash import compute_simhash, simhash_distance, simhash_similarity
 from .splitter import AstSplitter, Splitter, TextSplitter
 from .sync import FileSynchronizer
 from .vectordb import FaissVectorDB

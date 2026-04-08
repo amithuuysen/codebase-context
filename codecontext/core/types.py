@@ -101,7 +101,7 @@ class Config:
     @classmethod
     def from_env(cls) -> "Config":
         cfg = cls(
-            embedding_provider=os.getenv("EMBEDDING_PROVIDER", "openai").lower(),
+            embedding_provider=os.getenv("EMBEDDING_PROVIDER", "ollama").lower(),
             embedding_model=os.getenv("EMBEDDING_MODEL", ""),
             openai_api_key=os.getenv("OPENAI_API_KEY", ""),
             openai_base_url=os.getenv("OPENAI_BASE_URL", ""),

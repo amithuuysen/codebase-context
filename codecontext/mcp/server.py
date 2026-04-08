@@ -32,6 +32,10 @@ from .utils import ensure_absolute, install_shutdown_handlers, log_config, show_
 
 logger = logging.getLogger("codecontext")
 
+# Remote proxy mode: when INDEX_SERVER_URL is set, search is forwarded
+# to a remote index server instead of local FAISS.
+_remote_proxy = None  # RemoteSearchProxy | None
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -68,7 +72,7 @@ def _build_context(cfg: Config) -> Context:
 
 mcp = FastMCP(
     "codecontext",
-    host="127.0.0.1",
+    host="0.0.0.0",
     port=8877,
     streamable_http_path="/mcp",
 )
@@ -173,6 +177,33 @@ async def search_code(
 
     limit = min(limit, 50)
 
+    # --- Remote proxy mode: forward search to index server ---
+    if _remote_proxy:
+        import hashlib as _hl
+        workspace_id = os.path.basename(abs_path) + "_" + _hl.md5(abs_path.encode()).hexdigest()[:8]
+        try:
+            results = await _remote_proxy.search(workspace_id, query, top_k=limit)
+        except Exception as exc:
+            return f"Error: Remote search failed: {exc}"
+
+        if not results:
+            return f'No results found for query: "{query}" (remote index)'
+
+        lines: list[str] = []
+        lines.append(f'Found {len(results)} results for query: "{query}" (remote index)\n')
+        base = os.path.basename(abs_path)
+        for i, r in enumerate(results, 1):
+            loc = f"{r.relative_path}:{r.start_line}-{r.end_line}"
+            content = truncate(r.content)
+            lines.append(
+                f"{i}. Code snippet ({r.language}) [{base}]\n"
+                f"   Location: {loc}\n"
+                f"   Rank: {i}\n"
+                f"   Context:\n```{r.language}\n{content}\n```\n"
+            )
+        return "\n".join(lines)
+
+    # --- Local mode ---
     # Check index status
     is_indexed = abs_path in _snap.get_indexed_codebases()
     is_indexing = abs_path in _snap.get_indexing_codebases()
@@ -303,7 +334,7 @@ async def get_indexing_status(path: str) -> str:
 
 def main() -> None:
     """Entry point — run the MCP server over stdio."""
-    global _ctx, _snap, _sync
+    global _ctx, _snap, _sync, _remote_proxy
 
     # --help support
     if "--help" in sys.argv or "-h" in sys.argv:
@@ -324,6 +355,13 @@ def main() -> None:
     _snap = SnapshotManager()
     _snap.load_snapshot()
     _sync = SyncManager(_ctx, _snap)
+
+    # Remote proxy mode: forward searches to a shared index server
+    index_server_url = os.getenv("INDEX_SERVER_URL")
+    if index_server_url:
+        from codecontext.client.remote_search import RemoteSearchProxy
+        _remote_proxy = RemoteSearchProxy(index_server_url)
+        logger.info("Remote proxy mode: searches forwarded to %s", index_server_url)
 
     install_shutdown_handlers()
 

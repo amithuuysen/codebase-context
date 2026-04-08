@@ -121,6 +121,7 @@ codecontext/
 │   ├── merkle.py                  # Merkle tree sync (directory-aware O(changes) diff)
 │   ├── path_obfuscation.py        # HMAC-SHA256 path segment encryption for privacy
 │   ├── reranker.py                # Cross-encoder reranker (optional Stage 2)
+│   ├── simhash.py                 # SimHash locality-sensitive hashing (team index sharing)
 │   ├── sync.py                    # Flat file-hash sync (SHA-256 fallback)
 │   └── splitter/
 │       ├── __init__.py
@@ -133,6 +134,13 @@ codecontext/
 │   ├── snapshot.py                # SnapshotManager (V2 format, indexing state)
 │   ├── sync.py                    # SyncManager (background 5-min file-change sync)
 │   └── utils.py                   # ensure_absolute, truncate, log_config, shutdown
+├── server/                        # Remote index server (HTTP API)
+│   ├── __init__.py
+│   └── index_server.py            # Starlette ASGI app — upload, index, search, SimHash
+├── client/                        # Client for remote index server
+│   ├── __init__.py
+│   ├── sync_client.py             # SyncClient — upload files, trigger indexing, search
+│   └── remote_search.py           # RemoteSearchProxy — MCP ↔ index server bridge
 ```
 
 ## Key Design Decisions
@@ -191,7 +199,7 @@ All data persists locally under `~/.context/`:
 | Variable | Default | Description |
 |---|---|---|
 | `MCP_TRANSPORT` | `streamable-http` | `streamable-http`, `stdio`, or `sse` |
-| `EMBEDDING_PROVIDER` | `openai` | `openai`, `ollama`, or `local` |
+| `EMBEDDING_PROVIDER` | `ollama` | `openai`, `ollama`, or `local` |
 | `EMBEDDING_MODEL` | auto | Model name (auto-selected per provider) |
 | `OPENAI_API_KEY` | — | Required for OpenAI provider |
 | `OPENAI_BASE_URL` | — | Custom API endpoint |
@@ -204,6 +212,8 @@ All data persists locally under `~/.context/`:
 | `CODECONTEXT_DATA_DIR` | `~/.context` | Data storage directory |
 | `RERANKER_PROVIDER` | `none` | `none` or `local` (enables cross-encoder) |
 | `RERANKER_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Cross-encoder model |
+| `INDEX_SERVER_URL` | — | Remote index server URL (enables proxy mode) |
+| `PORT` | `8878` | Index server listen port |
 
 ## How to Run
 
@@ -217,15 +227,14 @@ uv sync
 ### 2. Configure Embeddings
 
 ```bash
-# Option A: OpenAI (default — requires API key)
+# Default: Ollama with nomic-embed-text (local, free, no API key needed)
+# Just ensure Ollama is running: ollama serve
+
+# Option A: OpenAI (requires API key)
 export EMBEDDING_PROVIDER=openai
 export OPENAI_API_KEY=sk-...
 
-# Option B: Ollama (local, free)
-export EMBEDDING_PROVIDER=ollama
-export OLLAMA_HOST=http://127.0.0.1:11434
-
-# Option C: Sentence-transformers (fully offline, no API key)
+# Option B: Sentence-transformers (fully offline, no API key)
 export EMBEDDING_PROVIDER=local
 ```
 
@@ -236,8 +245,28 @@ export RERANKER_PROVIDER=local
 export RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
 ```
 
-### 4. Run as MCP Server
+---
 
+### Mode A: Local Indexing (Single Developer)
+
+Everything runs on your machine — embedding, FAISS, BM25, search. No network calls.
+
+```
+┌──────────────────────────────────────────────────┐
+│                 Your Machine                      │
+│                                                   │
+│  VS Code / Claude Desktop                         │
+│       │ MCP (stdio)                               │
+│       ▼                                           │
+│  codecontext (MCP server)                         │
+│       │                                           │
+│       ├── Ollama (nomic-embed-text)               │
+│       ├── FAISS + BM25 index (~/.context/)        │
+│       └── Merkle tree sync                        │
+└──────────────────────────────────────────────────┘
+```
+
+**Run the MCP server:**
 ```bash
 # Default: streamable-http on http://127.0.0.1:8877/mcp
 uv run codecontext
@@ -246,19 +275,28 @@ uv run codecontext
 MCP_TRANSPORT=stdio uv run codecontext
 ```
 
-### 5. Connect to VS Code Copilot / Claude Desktop
-
-#### Option A: Streamable HTTP (recommended)
-
-Start the server first, then configure your MCP client to connect:
-
-**VS Code** (`.vscode/mcp.json`):
+**VS Code** (`.vscode/mcp.json`) — streamable-http:
 ```json
 {
   "servers": {
     "codecontext": {
       "type": "http",
       "url": "http://127.0.0.1:8877/mcp"
+    }
+  }
+}
+```
+
+**VS Code** (`.vscode/mcp.json`) — stdio:
+```json
+{
+  "servers": {
+    "codecontext": {
+      "command": "uv",
+      "args": ["run", "codecontext"],
+      "env": {
+        "MCP_TRANSPORT": "stdio"
+      }
     }
   }
 }
@@ -269,14 +307,65 @@ Start the server first, then configure your MCP client to connect:
 {
   "mcpServers": {
     "codecontext": {
-      "type": "http",
-      "url": "http://127.0.0.1:8877/mcp"
+      "command": "uv",
+      "args": ["run", "codecontext"],
+      "env": {
+        "MCP_TRANSPORT": "stdio"
+      }
     }
   }
 }
 ```
 
-#### Option B: stdio (VS Code/Claude spawns the process)
+> No `EMBEDDING_PROVIDER` or `OLLAMA_MODEL` needed — defaults to Ollama + nomic-embed-text. Just ensure `ollama serve` is running.
+
+---
+
+### Mode B: Remote Index Server (Team Sharing)
+
+Index server runs on a shared machine. Developers send files to it and search remotely — no local GPU needed on client machines.
+
+```
+Developer A (local)              Index Server (remote :8878)       Developer B (local)
+┌──────────────────┐   files    ┌──────────────────────┐  files   ┌──────────────────┐
+│ VS Code + MCP    │───────────▶│ FAISS + BM25         │◀─────────│ VS Code + MCP    │
+│ codecontext      │   JSON     │ Ollama embedding     │  JSON    │ codecontext      │
+│ (proxy mode)     │◀───search──│ SimHash registry     │──search─▶│ (proxy mode)     │
+│                  │   results  │ Shared team indexes  │  results │                  │
+└──────────────────┘            └──────────────────────┘          └──────────────────┘
+```
+
+#### Step 1: Start the index server (on your shared/remote machine)
+
+```bash
+# Install and run on the server
+cd codebase-context
+uv sync
+
+# Start with Ollama (ensure ollama serve is running on the server)
+uv run codecontext-server
+# Listens on 0.0.0.0:8878
+
+# Or with a custom port
+PORT=9000 uv run codecontext-server
+
+# Or with OpenAI embeddings on the server side
+EMBEDDING_PROVIDER=openai OPENAI_API_KEY=sk-... uv run codecontext-server
+```
+
+#### Step 2: Upload and index from a client (programmatic)
+
+```python
+from codecontext.client import SyncClient
+
+client = SyncClient("http://index-server:8878", "/path/to/codebase")
+await client.sync()                              # Upload + index
+results = await client.search("auth handler")    # Search remote
+```
+
+#### Step 3: Connect VS Code / Claude Desktop to the remote index
+
+When `INDEX_SERVER_URL` is set, the MCP server becomes a thin proxy — it forwards `search_code` queries to the remote index server instead of running local FAISS.
 
 **VS Code** (`.vscode/mcp.json`):
 ```json
@@ -285,36 +374,53 @@ Start the server first, then configure your MCP client to connect:
     "codecontext": {
       "command": "uv",
       "args": ["run", "codecontext"],
-      "cwd": "/path/to/codebase-context",
       "env": {
         "MCP_TRANSPORT": "stdio",
-        "EMBEDDING_PROVIDER": "ollama",
-        "OLLAMA_HOST": "http://127.0.0.1:11434"
+        "INDEX_SERVER_URL": "http://your-server:8878"
       }
     }
   }
 }
 ```
 
-**Claude Desktop**:
+**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 ```json
 {
   "mcpServers": {
     "codecontext": {
       "command": "uv",
       "args": ["run", "codecontext"],
-      "cwd": "/path/to/codebase-context",
       "env": {
         "MCP_TRANSPORT": "stdio",
-        "EMBEDDING_PROVIDER": "ollama",
-        "OLLAMA_HOST": "http://127.0.0.1:11434"
+        "INDEX_SERVER_URL": "http://your-server:8878"
       }
     }
   }
 }
 ```
 
-### 6. Run Tests
+> **No Ollama needed on client machines.** The index server handles all embedding and search. Clients only need `uv` and the `codecontext` package installed.
+
+#### SimHash Team Sharing
+
+When a developer uploads their codebase, the server computes a SimHash fingerprint and checks for similar existing indexes. If a teammate's index is 90%+ similar (e.g., same repo, different branch), the server reuses it — avoiding redundant re-indexing.
+
+#### Index Server API
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/upload-json` | POST | Upload files as JSON (batch of 100) |
+| `/api/index` | POST | Trigger indexing for a workspace |
+| `/api/search` | POST | Search indexed codebase |
+| `/api/status/{workspace_id}` | GET | Check indexing progress |
+| `/api/collections` | GET | List all indexed workspaces |
+| `/api/clear/{workspace_id}` | DELETE | Delete a workspace's index |
+| `/api/simhash` | POST | Find similar indexes by SimHash |
+| `/api/simhash/register` | POST | Register a workspace's SimHash fingerprint |
+
+---
+
+### 4. Run Tests
 
 ```bash
 # Core pipeline tests
@@ -326,3 +432,78 @@ uv run python test_accuracy.py
 # Hybrid architecture tests (BM25, RRF, Merkle tree, reranker)
 uv run python test_hybrid.py
 ```
+
+## Pricing Comparison (2026)
+
+CodeContext is free and open-source. Here's how it compares to paid alternatives:
+
+### Individual Plans
+
+| Tool | Plan | Price | Codebase Search |
+|---|---|---|---|
+| **GitHub Copilot** | Free | $0/mo | Local index capped at ~2,500 files |
+| **GitHub Copilot** | Pro | $10/mo | + remote index (GitHub.com repos only) |
+| **GitHub Copilot** | Pro+ | $39/mo | Same index limits, more model requests |
+| **Cursor** | Hobby | $0/mo | Limited hybrid search |
+| **Cursor** | Pro | $20/mo | Full hybrid search + Merkle sync |
+| **Cursor** | Pro+ | $60/mo | 3× model usage |
+| **Cursor** | Ultra | $200/mo | 20× model usage |
+| **CodeContext** | — | $0 | Hybrid search (FAISS + BM25 + RRF), no file limit |
+
+### Team Cost Comparison (10 developers)
+
+| Setup | Monthly | Annual |
+|---|---|---|
+| Copilot Pro | $100 | $1,200 |
+| Cursor Pro | $200 | $2,400 |
+| Cursor Teams | $400 | $4,800 |
+| **Copilot Pro + CodeContext** | **$100** | **$1,200** |
+
+> **Note:** Cursor and Copilot are full AI IDE products — not just search. They include code completion, AI chat, agent mode, and more. CodeContext only provides codebase search. See [What CodeContext Does NOT Replace](#what-codecontext-does-not-replace) below.
+
+## Where CodeContext Fits
+
+CodeContext doesn't replace Cursor or Copilot. It **fills a specific gap**: bringing Cursor-quality codebase search to tools that don't have it.
+
+| Scenario | Recommendation |
+|---|---|
+| **Large codebase + Copilot** | Add CodeContext as an MCP server. Copilot gets hybrid search across all files — no plan change needed. |
+| **Evaluating Cursor vs Copilot** | Stay in VS Code with Copilot + CodeContext. Save $10–30/user/month. |
+| **Enterprise team on a budget** | Copilot Pro ($10/user) + CodeContext (free) vs Cursor Teams ($40/user) = **$3,600/year saved** for 10 devs. |
+| **Privacy-sensitive projects** | CodeContext + Ollama = 100% local. No code leaves your machine. Copilot's remote index uploads code to GitHub's cloud; Cursor processes code on their servers. |
+| **Want the best AI IDE experience** | Use Cursor Pro ($20/mo). It's the most polished end-to-end product. |
+
+## What CodeContext Does NOT Replace
+
+| Feature | Cursor / Copilot | CodeContext |
+|---|---|---|
+| Code completion (tab) | ✅ Real-time, context-aware | ❌ Not a completion tool |
+| AI chat | ✅ Multi-model, streaming | ❌ Not a chat interface |
+| Agent mode | ✅ Multi-file editing | ❌ Feeds agents via MCP only |
+| Cloud agents | ✅ (Cursor Pro, Copilot Pro) | ❌ Local only |
+| PR code review | ✅ (Cursor Bugbot, Copilot) | ❌ Not in scope |
+| IDE integration | ✅ Deep, native | ⚠️ Via MCP protocol |
+| **Codebase search** | ✅ Proprietary | **✅ Open-source, comparable architecture** |
+| Custom embedding model | ✅ (Cursor trains their own) | ⚠️ Uses open models (nomic-embed-text) |
+
+## Known Limitations
+
+1. **First-index time** — Indexing 20K files with Ollama takes minutes, not seconds. Cursor has optimized proprietary infrastructure. Pipelining and caching mitigate this after the first run.
+2. **Embedding quality** — Cursor trains a custom embedding model on real coding sessions. CodeContext uses `nomic-embed-text` (137M params). Good, but not fine-tuned for code search.
+3. **MCP overhead** — Communication via MCP protocol adds ~50–100ms per query compared to native in-process search.
+4. **Mac-first optimization** — The pipelined engine is optimized for Apple Silicon (M4 Pro). Works on Linux/Windows but not tuned.
+
+## Privacy Considerations
+
+AI coding tools handle your source code differently:
+
+| Tool | Where Code Is Processed | Privacy Risk |
+|---|---|---|
+| **GitHub Copilot (local index)** | On your machine | Low — but capped at ~2,500 files |
+| **GitHub Copilot (remote index)** | Uploaded to GitHub's cloud (`api.github.com`) | **High** — your entire codebase is sent to GitHub's servers for indexing. Community reports indicate ~500MB uploads during indexing. Only works with GitHub.com repos. |
+| **Cursor** | Code sent to Cursor's servers for embedding + indexing | **High** — proprietary infrastructure, code leaves your machine |
+| **CodeContext + Ollama** | 100% on your machine | **None** — embedding runs locally via Ollama, FAISS index stored at `~/.context/`, no network calls |
+
+For teams working on proprietary code, regulated industries (healthcare, finance, defense), or codebases under NDA, remote indexing is a non-starter. Copilot's remote index sends your source code to GitHub's cloud infrastructure for processing — even if your repo is private. Cursor similarly processes code on their servers.
+
+CodeContext with Ollama keeps everything local: the embedding model runs on your machine's GPU/CPU, the FAISS index is stored on your local disk, and zero bytes of code are transmitted over the network.

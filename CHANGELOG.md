@@ -2,6 +2,39 @@
 
 All notable changes to CodeContext are documented in this file.
 
+## [0.4.0] — 2026-04-08
+
+### Remote Indexing & Team Index Sharing
+
+This release adds a standalone HTTP index server, enabling centralized team indexing and remote search. Developers upload files from local machines to a shared server, which handles embedding, indexing, and search — no local GPU required on client machines.
+
+#### Added
+
+- **HTTP index server** (`codecontext-server`) — Starlette ASGI app with 9 REST endpoints: upload files (JSON batch), trigger indexing, search, check status, list collections, clear index, SimHash lookup/register. Run via `uv run codecontext-server` on `0.0.0.0:8878`.
+- **SimHash locality-sensitive hashing** — 128-bit fingerprints for codebase similarity comparison. When a developer uploads, the server checks for existing indexes that are 90%+ similar (e.g., same repo, different branch) and reuses them to avoid redundant re-indexing. SimHash registry persists to `~/.context/simhash_registry.json`.
+- **Sync client** (`SyncClient`) — Collects local files, computes SimHash, uploads in batches of 100 via JSON, triggers remote indexing, and supports remote search. Uses `httpx.AsyncClient` with 300s timeout.
+- **Remote search proxy** (`RemoteSearchProxy`) — Bridge between MCP server and remote index server. When `INDEX_SERVER_URL` env var is set, the MCP `search_code` tool forwards queries to the remote server instead of local FAISS.
+- **`codecontext-server` entry point** — New CLI command to start the index server standalone.
+
+#### Changed
+
+- **Default embedding provider** — Changed from `openai` to `ollama` with `nomic-embed-text`. No env vars needed for a working setup — just ensure Ollama is running.
+- **New dependencies** — Added `starlette>=0.27.0`, `uvicorn>=0.20.0`, `httpx>=0.24.0` as mandatory dependencies.
+
+#### Architecture
+
+```
+Developer A (local)              Index Server (remote :8878)       Developer B (local)
+┌──────────────────┐   files    ┌──────────────────────┐  files   ┌──────────────────┐
+│ VS Code + MCP    │───────────▶│ FAISS + BM25         │◀─────────│ VS Code + MCP    │
+│ codecontext      │   JSON     │ Ollama embedding     │  JSON    │ codecontext      │
+│ (proxy mode)     │◀───search──│ SimHash registry     │──search─▶│ (proxy mode)     │
+│                  │   results  │ Shared team indexes  │  results │                  │
+└──────────────────┘            └──────────────────────┘          └──────────────────┘
+```
+
+---
+
 ## [0.3.0] — 2026-04-07
 
 ### Performance — Pipelined Indexing Engine
