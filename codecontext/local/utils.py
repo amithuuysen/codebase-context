@@ -73,6 +73,7 @@ ENVIRONMENT VARIABLES
   CHUNK_OVERLAP        Overlap between chunks (default: 200)
   CHUNK_LIMIT          Max total chunks (default: 450000)
   SYNC_INTERVAL_SECONDS  Background sync interval (default: 300)
+  INDEX_SERVER_URL     Remote index server URL (enables proxy mode)
 
 MCP TOOLS
   index_codebase       Index a directory for semantic search

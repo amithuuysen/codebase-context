@@ -260,6 +260,9 @@ class SyncClient:
                 "workspace_id": self.workspace_id,
                 "force": force,
             },
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     async def _register_simhash(self, simhash: str) -> dict[str, Any]:
         """Register this workspace's SimHash on the server for index reuse."""
@@ -282,9 +285,6 @@ class SyncClient:
         resp = await self._client.post(
             f"{self.server_url}/api/find-similar",
             json={"workspace_id": self.workspace_id},
-        )
-        resp.raise_for_status()
-        return resp.json()
         )
         resp.raise_for_status()
         return resp.json()

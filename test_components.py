@@ -5,7 +5,7 @@ from codecontext.core.splitter import AstSplitter, TextSplitter
 from codecontext.core.embedding import create_embedding
 from codecontext.core.vectordb import FaissVectorDB
 from codecontext.core.sync import FileSynchronizer
-from codecontext.mcp.snapshot import SnapshotManager
+from codecontext.local.snapshot import SnapshotManager
 from codecontext.core.context import Context
 
 print("=" * 60)

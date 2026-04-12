@@ -27,8 +27,8 @@ dependencies = [
 ]
 
 [project.scripts]
-codecontext = "codecontext.mcp.server:main"
-codecontext-server = "codecontext.server.index_server:run_server"
+codecontext = "codecontext.local.server:main"
+codecontext-server = "codecontext.remote.index_server:run_server"
 
 [build-system]
 requires = ["hatchling"]

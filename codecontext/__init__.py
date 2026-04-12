@@ -7,7 +7,8 @@ A Python reimplementation of zilliztech/claude-context that stores all
 vectors locally via FAISS instead of requiring Milvus/Zilliz Cloud.
 Exposes the same MCP tools so any AI agent can use it.
 
-Package layout mirrors the TypeScript original:
-  codecontext.core  — Core library (context, types, embedding, splitter, sync, vectordb)
-  codecontext.mcp   — MCP server (handlers, snapshot, sync, utils, server entry point)
+Package layout:
+  codecontext.core    — Core library (context, types, embedding, splitter, sync, vectordb)
+  codecontext.local   — Local MCP server (handlers, snapshot, sync, server entry point)
+  codecontext.remote  — Remote index server + proxy client (index_server, sync_client, proxy)
 """

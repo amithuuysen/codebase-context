@@ -184,12 +184,12 @@ All data persists locally under `~/.context/`:
 │       ├── index_store.json
 │       └── collection_meta.json
 ├── bm25_store/                        # Sparse keyword indices
-│   └── code_chunks_<hash>.json
-├── embedding_cache/                   # Embedding vector cache
-│   └── ollama_nomic-embed-text.json
+│   └── code_chunks_<hash>.pkl         # Binary pickle (5-10x faster than JSON)
+├── embedding_cache/                   # Embedding vector cache (SQLite)
+│   └── ollama_nomic-embed-text.db     # WAL mode, O(1) lookups, incremental writes
 ├── merkle/                            # Merkle tree snapshots
-│   ├── merkle_<hash>.json             # Directory-aware tree
-│   └── <hash>.json                    # Flat file-hash fallback
+│   └── merkle_<hash>.json             # Directory-aware tree
+├── simhash_registry.json              # SimHash fingerprints (team index reuse)eam index reuse)
 ├── path_obfuscation_key               # HMAC key (chmod 600)
 └── mcp-codebase-snapshot.json         # Indexing state (V2 format)
 ```
@@ -405,12 +405,381 @@ When `INDEX_SERVER_URL` is set, the MCP server becomes a thin proxy — it forwa
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/api/upload-json` | POST | Upload files as JSON (batch of 100) |
-| `/api/index` | POST | Trigger indexing for a workspace |
-| `/api/search` | POST | Search indexed codebase |
+| `/api/upload` | POST | Multipart file upload with `workspace_id` |
+| `/api/upload-json` | POST | Upload files as JSON (batch of 100, path traversal protected) |
+| `/api/index` | POST | Trigger background indexing for a workspace (`force` option) |
+| `/api/search` | POST | Semantic search (`workspace_id`, `query`, `limit` max 50) |
 | `/api/status/{workspace_id}` | GET | Check indexing progress |
 | `/api/collections` | GET | List all indexed workspaces |
-| `/api/clear/{workspace_id}` | DELETE | Delete a workspace's index |
+| `/api/clear/{workspace_id}` | DELETE | Delete a workspace's index + SimHash entry |
+| `/api/register-simhash` | POST | Register/update workspace SimHash fingerprint |
+| `/api/find-similar` | POST | Find similar existing index for reuse |
+
+The index server also exposes MCP tools at `/mcp` — same 4 tools as local mode (`index_codebase`, `search_code`, `clear_index`, `get_indexing_status`).
+
+---
+
+## Architecture Components — What Each Piece Does
+
+### Component Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          INDEXING PIPELINE                              │
+│                                                                         │
+│  Codebase → Merkle Tree → File Discovery → AST Splitter → Chunks      │
+│                                               │                         │
+│                              ┌─────────────────┼──────────────────┐     │
+│                              ▼                 ▼                  ▼     │
+│                     Embedding Cache    FAISS (dense)    BM25 (sparse)  │
+│                     (SQLite, SHA-256   (IndexFlatIP,    (inverted      │
+│                      → vector)         cosine sim)      index, IDF)    │
+│                                                                         │
+│                              └─────────────────┼──────────────────┘     │
+│                                                ▼                        │
+│                                    RRF (Reciprocal Rank Fusion)         │
+│                                    score = Σ 1/(60 + rank)              │
+│                                                │                        │
+│                                                ▼                        │
+│                                    Cross-Encoder Reranker               │
+│                                    (optional Stage 2)                   │
+│                                                │                        │
+│                                                ▼                        │
+│                                         Search Results                  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1. Merkle Tree Sync (`core/merkle.py`)
+
+**What it does:** Detects which files changed since the last index — without re-scanning every file.
+
+**How it works:**
+- Leaf nodes = SHA-256 hash of each file's content
+- Internal nodes = hash of children's hashes
+- On re-index: compare root hashes. If they match → nothing changed. If they differ → walk only divergent branches
+
+**Performance:**
+- 50K-file repo with 3 changed files: O(log N + 3) vs O(50K) for flat scan
+- Files are hashed in parallel via ThreadPool (up to 16 workers) for repos with 100+ files
+- Ignore patterns are pre-compiled into a single regex for fast matching
+
+**Problem it solves:** Without Merkle trees, every 5-minute sync pass would need to hash all 50K files just to find 3 changes. With Merkle trees, it compares a single root hash first.
+
+### 2. AST Splitter (`core/splitter/ast_splitter.py`)
+
+**What it does:** Splits code into logical chunks (functions, classes, methods) instead of arbitrary character offsets.
+
+**How it works:**
+- Tree-sitter parses code into an AST
+- Extracts top-level declarations (functions, classes, interfaces, etc.)
+- Supports 8 languages: Python, JavaScript, TypeScript, Java, Go, Rust, C, C++
+- Falls back to character-based TextSplitter for unsupported languages
+- Oversized chunks are split at line boundaries with overlap
+
+**Problem it solves:** Character-based splitting breaks functions in half — the embedding for half a function is meaningless. AST splitting ensures each chunk is a complete logical unit.
+
+### 3. Embedding Cache (`core/embedding_cache.py`)
+
+**What it does:** Caches embedding vectors keyed by chunk content hash. If a chunk's text hasn't changed, skip the embedding API call entirely.
+
+**How it works:**
+- SQLite database with WAL mode for fast concurrent reads
+- Three-tier lookup: pending buffer → in-memory read-through cache → SQLite
+- Bulk `get_batch()` fetches hundreds of hashes in a single SQL query
+- Vectors stored as compact binary (4 bytes per float32 via `struct.pack`)
+- Auto-migrates from legacy JSON on first run (renames old file to `.json.bak`)
+
+**Performance:**
+- Startup: instant (no full cache load) vs 30+ seconds for 1.2 GB JSON
+- Lookups: ~50ns (in-memory dict hit) vs ~50-100μs (SQLite miss)
+- Saves: incremental (only dirty entries) vs full rewrite
+
+**Problem it solves:** Embedding is the most expensive step. For re-indexing a 20K-file codebase where 50 files changed, the cache skips ~99.75% of embedding API calls.
+
+### 4. FAISS Vector Database (`core/vectordb.py`)
+
+**What it does:** Stores and searches dense embedding vectors via cosine similarity.
+
+**How it works:**
+- `IndexFlatIP` (inner product on L2-normalized vectors = cosine similarity)
+- Per-collection indices: each codebase gets its own FAISS index
+- Soft-delete: FAISS doesn't support deletion, so deleted doc IDs are tracked and filtered at query time
+- `copy_collection()`: copies FAISS files on disk for team index reuse
+
+**Problem it solves:** Finds code by *meaning* — a query for "authentication" matches `session.ts` even though the word "authentication" never appears in the file.
+
+### 5. BM25 Keyword Index (`core/bm25.py`)
+
+**What it does:** Classic keyword search using an inverted index with BM25 scoring.
+
+**How it works:**
+- Code-aware tokenizer: splits camelCase and snake_case (`processUserInput` → `["process", "user", "input"]`)
+- BM25 with k1=1.5, b=0.75 (standard parameters)
+- Persisted as binary pickle (5-10x faster than JSON for 900 MB+ indices)
+- Auto-migrates from legacy JSON
+
+**Problem it solves:** Semantic search misses exact keyword matches. A query for `PaymentService` should find all exact imports — BM25 handles this perfectly.
+
+### 6. Hybrid Search + RRF (`core/hybrid_search.py`)
+
+**What it does:** Merges FAISS (dense) and BM25 (sparse) results into a single ranked list.
+
+**How it works:**
+- Both FAISS and BM25 over-fetch (3x top_k candidates)
+- RRF formula: `score(doc) = Σ 1/(60 + rank_in_list)` across both lists
+- Items appearing in both lists are naturally boosted
+- No score normalization needed (FAISS cosine and BM25 IDF are on different scales)
+
+**Problem it solves:** Neither dense nor sparse search alone is sufficient. Cursor's research shows hybrid search is **12.5% more accurate** than either alone.
+
+### 7. Cross-Encoder Reranker (`core/reranker.py`)
+
+**What it does:** Refines the top-N candidates from Stage 1 with full cross-attention scoring.
+
+**How it works:**
+- Stage 1: FAISS + BM25 → RRF (fast, bi-encoder, over-fetches 3x)
+- Stage 2: Cross-encoder scores each (query, chunk) pair with full attention
+- Default model: `cross-encoder/ms-marco-MiniLM-L-6-v2` (sentence-transformers)
+- Graceful fallback: if model can't load, reverts to pass-through (no reranking)
+
+**Problem it solves:** Bi-encoder similarity (FAISS) is fast but imprecise for edge cases. Cross-attention is ~100x slower but much more accurate — affordable on top-N candidates only.
+
+### 8. Path Obfuscation (`core/path_obfuscation.py`)
+
+**What it does:** Encrypts file path segments with HMAC-SHA256 so the vector index stores no plaintext file names.
+
+**How it works:**
+- Path split by `/` and `.` into segments
+- Each segment encrypted with a local secret key (stored at `~/.context/path_obfuscation_key`)
+- Deterministic: same input always produces same output (enables deduplication)
+- Decryption only possible with the local key
+
+**Problem it solves:** If the FAISS index is compromised, attackers see `[a3f2c1, 9b4e7d]` instead of `src/auth/middleware.ts`. Matches Cursor's Architecture §5.
+
+### 9. SimHash Index Reuse (`core/simhash.py` + `server/index_server.py`)
+
+**What it does:** When a new team member joins, copies a similar teammate's index instead of re-indexing from scratch.
+
+**How it works:**
+- SimHash: 128-bit locality-sensitive hash computed from all file content hashes
+- Server maintains a registry of `{workspace_id → simhash}` fingerprints
+- New workspace computes SimHash → server finds best match above 85% threshold
+- If found: copies FAISS + BM25 from the donor workspace, then runs incremental indexing to reconcile differences
+
+**Performance impact (from Cursor's data):**
+- Median repo: 7.87s → 525ms
+- 99th percentile: 4.03 hours → 21 seconds
+
+**Problem it solves:** Teammates on the same repo share ~92% of the same files. Without reuse, every developer pays the full indexing cost independently.
+
+### 10. Background Sync (`mcp/sync.py`)
+
+**What it does:** Automatically re-indexes changed files every 5 minutes after the initial index.
+
+**How it works:**
+- `SyncManager.start_background_sync()` — starts after first successful index
+- Phase 1: Initial sync after 5 seconds
+- Phase 2: Periodic sync every 300 seconds (configurable via `SYNC_INTERVAL_SECONDS`)
+- Uses `context.reindex_by_change()` which leverages Merkle tree diffs — only re-processes actually changed files
+
+**Problem it solves:** Without background sync, search results become stale as developers edit code. The 5-minute interval matches Cursor's architecture.
+
+---
+
+## Client-Server Model
+
+CodeContext supports two deployment modes: **local** (single developer) and **client-server** (team).
+
+### Local Mode (Default)
+
+Everything runs on one machine — embedding, indexing, search, and the MCP server.
+
+```
+┌──────────────────────────────────────────────────┐
+│                 Your Machine                      │
+│                                                   │
+│  VS Code / Claude Desktop                         │
+│       │ MCP (stdio or streamable-http)            │
+│       ▼                                           │
+│  codecontext (MCP server, port 8877)              │
+│       │                                           │
+│       ├── Ollama (nomic-embed-text, port 11434)   │
+│       ├── FAISS + BM25 index (~/.context/)        │
+│       ├── Embedding cache (SQLite)                │
+│       ├── Merkle tree sync (every 5 min)          │
+│       └── AST splitter (Tree-sitter)              │
+└──────────────────────────────────────────────────┘
+```
+
+**Prerequisites:** `uv`, Ollama running with `nomic-embed-text` pulled.
+
+### Client-Server Mode (Team)
+
+The index server centralizes embedding and search. Clients upload files and query remotely — no local GPU or Ollama needed on client machines.
+
+```
+┌─ Client Machines ────────┐            ┌─ Index Server (:8878) ─────────┐
+│                          │            │                                │
+│  VS Code + MCP           │   files    │  Ollama (embedding)            │
+│  codecontext             │───────────▶│  FAISS + BM25 (per workspace)  │
+│  (proxy mode)            │   search   │  Embedding cache (SQLite)      │
+│                          │◀───results─│  SimHash registry (team reuse) │
+│  No Ollama needed        │            │  Background sync (5 min)       │
+│  No GPU needed           │            │  Merkle tree sync              │
+└──────────────────────────┘            └────────────────────────────────┘
+```
+
+**How proxy mode works:** When `INDEX_SERVER_URL` is set, the MCP server becomes a thin proxy:
+1. `index_codebase` → uploads files to the index server, triggers remote indexing
+2. `search_code` → forwards query to the remote index server
+3. `clear_index` → clears remote index
+4. `get_indexing_status` → polls remote status
+
+The client never runs an embedding model — all heavy computation happens on the server.
+
+**SimHash team reuse:** When a new developer connects, the server computes their codebase SimHash and checks if a similar index already exists (≥85% similarity). If found, it copies the existing index and only re-indexes the differences — reducing median indexing from ~8 seconds to ~500ms.
+
+---
+
+## Startup Guide
+
+### Quick Start (Local Mode — Single Developer)
+
+```bash
+# 1. Clone and install
+git clone <repo-url> codebase-context
+cd codebase-context
+uv sync
+
+# 2. Start Ollama (if not already running)
+ollama serve &
+ollama pull nomic-embed-text
+
+# 3. Start the MCP server
+uv run codecontext
+# → Listening on http://127.0.0.1:8877/mcp (streamable-http)
+
+# 4. Configure your editor (see Mode A section above)
+```
+
+That's it. Open your editor, use `index_codebase` to index a project, then `search_code` to search.
+
+### Quick Start (Client-Server Mode — Team)
+
+**On the server machine:**
+```bash
+# 1. Install
+cd codebase-context && uv sync
+
+# 2. Start Ollama
+ollama serve &
+ollama pull nomic-embed-text
+
+# 3. Start the index server
+uv run codecontext-server
+# → Listening on 0.0.0.0:8878
+```
+
+**On each developer machine:**
+```bash
+# 1. Install (no Ollama needed)
+cd codebase-context && uv sync
+
+# 2. Start MCP server in proxy mode
+INDEX_SERVER_URL=http://your-server:8878 uv run codecontext
+```
+
+Or configure it in `.vscode/mcp.json`:
+```json
+{
+  "servers": {
+    "codecontext": {
+      "command": "uv",
+      "args": ["run", "codecontext"],
+      "env": {
+        "MCP_TRANSPORT": "stdio",
+        "INDEX_SERVER_URL": "http://your-server:8878"
+      }
+    }
+  }
+}
+```
+
+### Verifying It Works
+
+```bash
+# Check server health
+curl http://localhost:8878/api/collections
+
+# Index programmatically
+python -c "
+import asyncio
+from codecontext.client import SyncClient
+async def go():
+    c = SyncClient('http://localhost:8878', '/path/to/codebase')
+    await c.sync()
+    results = await c.search('authentication handler')
+    for r in results:
+        print(f\"  {r['relative_path']}:{r['start_line']} (score={r['score']:.3f})\")
+    await c.close()
+asyncio.run(go())
+"
+```
+
+---
+
+## Problem-Solving Techniques
+
+### Problem: "Indexing is slow on first run"
+
+**Root cause:** Embedding is the bottleneck — each chunk requires an API call to Ollama/OpenAI.
+
+**Mitigations already in place:**
+1. **Embedding cache (SQLite):** After the first run, 99%+ of chunks are served from cache — re-indexing a 20K-file codebase with 50 changed files skips ~19,950 files worth of embeddings
+2. **Pipelined producer-consumer:** File splitting (thread pool, up to 14 workers) runs concurrently with embedding — while batch N is being embedded, batch N+1 is being split
+3. **Parallel embedding sub-batches:** Embedding requests are split into parallel sub-batches matching `OLLAMA_NUM_PARALLEL` (default 4)
+4. **SimHash index reuse:** In team mode, new members copy an existing index instead of building from scratch
+
+**What you can tune:**
+```bash
+# Increase Ollama parallelism (on Ollama server)
+OLLAMA_NUM_PARALLEL=8 ollama serve
+
+# Adjust batch size
+EMBEDDING_BATCH_SIZE=200 uv run codecontext
+
+# Use OpenAI for faster cloud embeddings
+EMBEDDING_PROVIDER=openai OPENAI_API_KEY=sk-... uv run codecontext
+```
+
+### Problem: "Search doesn't find what I expected"
+
+**Debugging steps:**
+1. **Check indexing status:** Use `get_indexing_status` — if it shows "indexing" at <80%, results may be incomplete
+2. **Try both query styles:** Semantic search finds code by meaning, but exact symbol names work better with keywords. The hybrid search (FAISS + BM25 + RRF) handles both, but very short queries (1-2 words) may benefit from being more specific
+3. **Check file extensions:** Only supported extensions are indexed (23 by default). Use `customExtensions` in `index_codebase` to add more
+4. **Force re-index:** If files were changed outside the 5-min sync window, use `index_codebase` with `force=true`
+
+### Problem: "Memory usage is high"
+
+**What consumes memory:**
+- FAISS index: ~4 bytes × dimensions × num_chunks (768-dim × 100K chunks ≈ 300 MB)
+- BM25 index: in-memory inverted index + document store
+- Embedding cache read-through: grows as chunks are looked up
+
+**Mitigations:**
+- The embedding cache on-disk is SQLite — only looked-up entries are loaded into memory
+- BM25 uses pickle persistence (5-10x less I/O than JSON)
+- FAISS `IndexFlatIP` is the simplest index — for very large repos, consider IVFPQ (not yet implemented)
+
+### Problem: "Background sync isn't picking up changes"
+
+**How it works:** `SyncManager` starts after the first successful index, waits 5 seconds, then syncs every 5 minutes. It uses Merkle tree diffs — only branches where hashes diverge are walked.
+
+**Debugging:**
+- Check logs for `SyncManager` messages
+- The sync interval is configurable: `SYNC_INTERVAL_SECONDS=60` for faster updates
+- Manual re-index: call `index_codebase` again (without `force`) — it will skip unchanged files automatically
 
 ---
 

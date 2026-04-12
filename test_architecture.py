@@ -130,12 +130,12 @@ with tempfile.TemporaryDirectory() as tmpdir:
 # ---------------------------------------------------------------------------
 print()
 print("--- 3. SimHash Registry ---")
-from codecontext.server.index_server import (
+from codecontext.remote.index_server import (
     _load_simhash_registry,
     _save_simhash_registry,
     _find_similar_index,
 )
-import codecontext.server.index_server as _isrv
+import codecontext.remote.index_server as _isrv
 
 with tempfile.TemporaryDirectory() as tmpdir:
     # Patch config for test
