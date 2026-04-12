@@ -87,6 +87,20 @@ class SnapshotManager:
             return info.indexing_percentage
         return None
 
+    def is_searchable(self, path: str) -> bool:
+        """True if the codebase can be searched — indexed or >=80% complete.
+
+        Architecture §9: 'available at 80% completion'.
+        """
+        info = self._codebases.get(path)
+        if info is None:
+            return False
+        if info.status == "indexed":
+            return True
+        if info.status == "indexing" and info.indexing_percentage >= 80:
+            return True
+        return False
+
     # ------------------------------------------------------------------
     # State transitions
     # ------------------------------------------------------------------

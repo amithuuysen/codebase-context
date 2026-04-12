@@ -206,6 +206,36 @@ class Context:
             _report(progress, "No files to index", 100, 100, 100)
             return {"indexed_files": 0, "total_chunks": 0, "status": "completed"}
 
+        # Skip unchanged files (Architecture §2.2): when not force-reindexing
+        # and a previous Merkle tree exists, only process files whose content
+        # hash has changed since last index.
+        skipped_unchanged = 0
+        col = self.get_collection_name(codebase_path)
+        if not force_reindex and self.vector_db.has_collection(col):
+            merkle = self._merkle_synchronizers.get(col)
+            if merkle is None:
+                merkle = MerkleSynchronizer(codebase_path, self.ignore_patterns)
+                await merkle.initialize()
+                self._merkle_synchronizers[col] = merkle
+            if merkle._saved_tree is not None:
+                files, skipped_unchanged = self._skip_unchanged_files(
+                    files, codebase_path, merkle
+                )
+                if skipped_unchanged:
+                    logger.info(
+                        "Skipped %d unchanged files, %d files to process",
+                        skipped_unchanged, len(files),
+                    )
+
+        if not files and skipped_unchanged > 0:
+            _report(progress, "All files unchanged — nothing to index", 100, 100, 100)
+            return {
+                "indexed_files": 0,
+                "total_chunks": 0,
+                "skipped_unchanged": skipped_unchanged,
+                "status": "completed",
+            }
+
         result = await self._process_file_list(files, codebase_path, progress)
 
         # Persist sync snapshot (Merkle tree + flat hash fallback)
@@ -391,6 +421,50 @@ class Context:
     # Internals
     # ------------------------------------------------------------------
 
+    def _skip_unchanged_files(
+        self,
+        file_paths: list[str],
+        codebase_path: str,
+        merkle: MerkleSynchronizer,
+    ) -> tuple[list[str], int]:
+        """Filter out files whose content hash hasn't changed since last index.
+
+        Compares each file's current SHA-256 against the saved Merkle tree.
+        Returns (files_to_process, count_skipped).
+        """
+        saved_hashes = self._collect_saved_hashes(merkle._saved_tree)
+        changed: list[str] = []
+        skipped = 0
+
+        for fpath in file_paths:
+            rel = os.path.relpath(fpath, codebase_path)
+            current_hash = MerkleSynchronizer._hash_file(fpath)
+            saved_hash = saved_hashes.get(rel)
+
+            if saved_hash and saved_hash == current_hash:
+                # File unchanged — check if its chunks exist in FAISS
+                col_name = self.get_collection_name(codebase_path)
+                if self.vector_db.has_collection(col_name):
+                    skipped += 1
+                    continue
+
+            changed.append(fpath)
+
+        return changed, skipped
+
+    @staticmethod
+    def _collect_saved_hashes(node, prefix: str = "") -> dict[str, str]:
+        """Flatten a Merkle tree into {relative_path: file_hash}."""
+        if node is None:
+            return {}
+        result: dict[str, str] = {}
+        if not node.is_dir:
+            result[node.path] = node.hash
+        else:
+            for child in node.children.values():
+                result.update(Context._collect_saved_hashes(child))
+        return result
+
     def _prepare_collection(self, codebase_path: str, force: bool = False) -> None:
         col_name = self.get_collection_name(codebase_path)
         exists = self.vector_db.has_collection(col_name)
@@ -434,19 +508,39 @@ class Context:
         return files
 
     def _matches_ignore(self, path: str, base: str) -> bool:
-        from fnmatch import fnmatch
         rel = os.path.relpath(path, base)
         name = os.path.basename(path)
         if name.startswith("."):
             return True
+        # Use compiled regex for fast matching (built lazily once)
+        compiled = self._get_compiled_ignore()
+        if compiled is not None and compiled.search(rel):
+            return True
+        if compiled is not None and compiled.search(name):
+            return True
+        # Fallback for suffix patterns
         for pat in self.ignore_patterns:
             if pat == name:
-                return True
-            if fnmatch(rel, pat) or fnmatch(name, pat):
                 return True
             if pat.endswith("/**") and rel.startswith(pat[:-3]):
                 return True
         return False
+
+    def _get_compiled_ignore(self):
+        """Lazily compile ignore patterns into a single regex for speed."""
+        if not hasattr(self, "_compiled_ignore_re"):
+            import re
+            from fnmatch import translate
+            parts = []
+            for pat in self.ignore_patterns:
+                if not pat.endswith("/**"):
+                    parts.append(translate(pat))
+            if parts:
+                combined = "|".join(parts)
+                self._compiled_ignore_re = re.compile(combined)
+            else:
+                self._compiled_ignore_re = None
+        return self._compiled_ignore_re
 
     def _read_and_split_file(self, fpath: str) -> tuple[str, list[CodeChunk] | None]:
         """Read a file and split it into chunks (runs in thread pool)."""
@@ -490,7 +584,9 @@ class Context:
         logger.info("Using %d workers for parallel file splitting (pipelined)", max_workers)
 
         # --- Async queue: decouples splitting (producer) from embedding (consumer) ---
-        queue: asyncio.Queue[list[CodeChunk] | None] = asyncio.Queue(maxsize=4)
+        # Larger queue (8) allows more producer-consumer overlap so the
+        # producer never stalls waiting for the consumer to embed.
+        queue: asyncio.Queue[list[CodeChunk] | None] = asyncio.Queue(maxsize=8)
 
         import time as _time
 
@@ -647,8 +743,9 @@ class Context:
         # nomic-embed-text has a 2048 token context; ~4 chars/token for code
         # gives a safe limit of ~8000 chars.  We cap at chunk_size as the max.
         max_embed_chars = self._cfg.chunk_size
-        cache_hits = 0
 
+        # Phase 1: Build all TextNodes and collect text hashes
+        node_data: list[tuple[TextNode, str]] = []  # (node, text_hash)
         for chunk in chunks:
             text = chunk.content
             if len(text) > max_embed_chars:
@@ -687,9 +784,16 @@ class Context:
             node.excluded_embed_metadata_keys = list(node.metadata.keys())
             node.excluded_llm_metadata_keys = list(node.metadata.keys())
 
-            # Embedding cache lookup — skip embedding API call for unchanged chunks
             text_hash = cache.content_hash(text)
-            cached_embedding = cache.get(text_hash)
+            node_data.append((node, text_hash))
+
+        # Phase 2: Bulk cache lookup — single SQL query instead of N queries
+        all_hashes = [h for _, h in node_data]
+        cached_map = cache.get_batch(all_hashes)
+        cache_hits = 0
+
+        for node, text_hash in node_data:
+            cached_embedding = cached_map.get(text_hash)
             if cached_embedding is not None:
                 cached_nodes.append((node, cached_embedding))
                 cache_hits += 1
@@ -698,13 +802,14 @@ class Context:
 
             # Also add to BM25 sparse index (parallel indexing)
             if bm25:
+                meta = node.metadata
                 bm25.add_document(
-                    doc_id=node_id,
-                    content=text,
-                    relative_path=rel,
-                    start_line=chunk.start_line,
-                    end_line=chunk.end_line,
-                    language=chunk.language,
+                    doc_id=node.id_,
+                    content=node.text,
+                    relative_path=meta.get("relative_path", ""),
+                    start_line=meta.get("start_line", 0),
+                    end_line=meta.get("end_line", 0),
+                    language=meta.get("language", "text"),
                 )
 
         if cache_hits:
@@ -725,7 +830,10 @@ class Context:
             embed_model = self.vector_db._embed_model
             try:
                 texts = [n.text for n in nodes]
-                sub_batch_size = max(25, len(texts) // 4)  # ~4 concurrent requests
+                # Adaptive sub-batching: match Ollama's OLLAMA_NUM_PARALLEL
+                # (default 4). Smaller sub-batches keep all model slots busy.
+                num_parallel = int(os.getenv("OLLAMA_NUM_PARALLEL", "4"))
+                sub_batch_size = max(10, len(texts) // num_parallel)
                 sub_batches = [
                     texts[i:i + sub_batch_size]
                     for i in range(0, len(texts), sub_batch_size)

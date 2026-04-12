@@ -97,6 +97,48 @@ class FaissVectorDB:
     def get_collection_description(self, name: str) -> str:
         return self._descriptions.get(name, "")
 
+    def copy_collection(self, source_name: str, target_name: str) -> bool:
+        """Copy an existing FAISS collection to a new name.
+
+        Used for team index reuse: when a similar index exists, copy it
+        as a starting point instead of re-indexing from scratch.
+
+        Returns True if copied successfully.
+        """
+        src_dir = self._persist_dir / source_name
+        dst_dir = self._persist_dir / target_name
+        if not src_dir.exists() or source_name not in self._indices:
+            logger.warning("Cannot copy: source collection '%s' not found", source_name)
+            return False
+        if target_name in self._indices:
+            logger.info("Target collection '%s' already exists, skipping copy", target_name)
+            return False
+
+        # Copy files on disk
+        shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
+
+        # Update the description in the copy
+        meta_file = dst_dir / "collection_meta.json"
+        if meta_file.exists():
+            with open(meta_file) as f:
+                meta = json.load(f)
+            src_desc = meta.get("description", "")
+            meta["description"] = src_desc.replace(source_name, target_name)
+            # Clear soft-deletions in the copy (fresh start)
+            meta["deleted_refs"] = []
+            with open(meta_file, "w") as f:
+                json.dump(meta, f)
+
+        # Load the copy into memory
+        if self._load_collection(target_name):
+            logger.info("Copied collection '%s' → '%s'", source_name, target_name)
+            return True
+
+        # Cleanup on failure
+        if dst_dir.exists():
+            shutil.rmtree(dst_dir)
+        return False
+
     # ------------------------------------------------------------------
     # Insert LlamaIndex TextNodes
     # ------------------------------------------------------------------
@@ -217,27 +259,36 @@ class FaissVectorDB:
         for col_dir in sorted(self._persist_dir.iterdir()):
             if not col_dir.is_dir():
                 continue
-            meta_file = col_dir / "collection_meta.json"
-            if not meta_file.exists():
-                continue
-            name = col_dir.name
-            try:
-                with open(meta_file) as f:
-                    meta = json.load(f)
+            self._load_collection(col_dir.name)
 
-                vector_store = FaissVectorStore.from_persist_dir(str(col_dir))
-                storage_ctx = StorageContext.from_defaults(
-                    vector_store=vector_store, persist_dir=str(col_dir)
-                )
-                index = load_index_from_storage(
-                    storage_ctx, embed_model=self._embed_model
-                )
-                self._indices[name] = index
-                self._descriptions[name] = meta.get("description", "")
-                self._dimensions[name] = meta.get("dimension", 0)
-                deleted = meta.get("deleted_refs", [])
-                if deleted:
-                    self._deleted_refs[name] = set(deleted)
-                logger.info("Loaded FAISS collection '%s' from disk", name)
-            except Exception as exc:
-                logger.warning("Failed to load collection %s: %s", name, exc)
+    def _load_collection(self, name: str) -> bool:
+        """Load a single collection from disk into memory.
+
+        Returns True if loaded successfully, False otherwise.
+        """
+        col_dir = self._persist_dir / name
+        meta_file = col_dir / "collection_meta.json"
+        if not col_dir.is_dir() or not meta_file.exists():
+            return False
+        try:
+            with open(meta_file) as f:
+                meta = json.load(f)
+
+            vector_store = FaissVectorStore.from_persist_dir(str(col_dir))
+            storage_ctx = StorageContext.from_defaults(
+                vector_store=vector_store, persist_dir=str(col_dir)
+            )
+            index = load_index_from_storage(
+                storage_ctx, embed_model=self._embed_model
+            )
+            self._indices[name] = index
+            self._descriptions[name] = meta.get("description", "")
+            self._dimensions[name] = meta.get("dimension", 0)
+            deleted = meta.get("deleted_refs", [])
+            if deleted:
+                self._deleted_refs[name] = set(deleted)
+            logger.info("Loaded FAISS collection '%s' from disk", name)
+            return True
+        except Exception as exc:
+            logger.warning("Failed to load collection %s: %s", name, exc)
+            return False

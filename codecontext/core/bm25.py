@@ -228,47 +228,66 @@ class BM25Index:
     # ------------------------------------------------------------------
 
     def save(self, path: str | Path) -> None:
-        """Serialize the BM25 index to a JSON file."""
+        """Serialize the BM25 index to a binary (pickle) file.
+
+        Falls back to JSON if the path ends with .json (legacy compat).
+        Pickle is ~5-10x faster than JSON for large indices (900 MB+).
+        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        docs_data = {}
-        for did, doc in self._docs.items():
-            docs_data[did] = {
-                "rp": doc.relative_path,
-                "sl": doc.start_line,
-                "el": doc.end_line,
-                "lang": doc.language,
-                "text": doc.content,
-                "tc": doc.token_count,
-            }
+        # Prefer binary .pkl format
+        pkl_path = path.with_suffix(".pkl") if path.suffix == ".json" else path
 
-        # Inverted index: token → list of doc_ids
-        inv_data = {t: sorted(dids) for t, dids in self._inv.items()}
-
-        # TF: flatten to list of [doc_id, token, count]
-        tf_data = [[did, tok, cnt] for (did, tok), cnt in self._tf.items()]
-
+        import pickle
         data = {
             "k1": self.k1,
             "b": self.b,
             "total_docs": self._total_docs,
             "avg_dl": self._avg_dl,
-            "deleted_refs": sorted(self._deleted_refs),
-            "docs": docs_data,
-            "inv": inv_data,
-            "tf": tf_data,
+            "deleted_refs": self._deleted_refs,
+            "docs": self._docs,
+            "inv": self._inv,
+            "tf": self._tf,
         }
-        with open(path, "w") as f:
-            json.dump(data, f)
+        with open(pkl_path, "wb") as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     @classmethod
     def load(cls, path: str | Path) -> "BM25Index":
-        """Deserialize a BM25 index from a JSON file."""
+        """Deserialize a BM25 index from a pickle or JSON file."""
         path = Path(path)
-        if not path.exists():
-            return cls()
 
+        # Try binary pickle first (faster)
+        pkl_path = path.with_suffix(".pkl") if path.suffix == ".json" else path
+        if pkl_path.exists():
+            return cls._load_pickle(pkl_path)
+
+        # Fall back to legacy JSON
+        if path.exists() and path.suffix == ".json":
+            return cls._load_json(path)
+
+        return cls()
+
+    @classmethod
+    def _load_pickle(cls, path: Path) -> "BM25Index":
+        """Load from binary pickle format."""
+        import pickle
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+
+        idx = cls(k1=data.get("k1", 1.5), b=data.get("b", 0.75))
+        idx._total_docs = data.get("total_docs", 0)
+        idx._avg_dl = data.get("avg_dl", 0.0)
+        idx._deleted_refs = data.get("deleted_refs", set())
+        idx._docs = data.get("docs", {})
+        idx._inv = data.get("inv", defaultdict(set))
+        idx._tf = data.get("tf", {})
+        return idx
+
+    @classmethod
+    def _load_json(cls, path: Path) -> "BM25Index":
+        """Load from legacy JSON format (auto-migrated on next save)."""
         with open(path) as f:
             data = json.load(f)
 
@@ -294,4 +313,5 @@ class BM25Index:
         for did, tok, cnt in data.get("tf", []):
             idx._tf[(did, tok)] = cnt
 
+        logger.info("Loaded BM25 from legacy JSON, will save as pickle next time")
         return idx

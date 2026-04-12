@@ -17,20 +17,16 @@
 - [x] Adaptive thread pool (scales to CPU cores, up to 14 for M4 Pro)
 - [x] Periodic embedding cache saves (every 10 batches)
 - [x] Pipeline timing instrumentation (wall, split, embed, overlap, throughput)
+- [x] Skip unchanged files during initial index (Merkle tree hash comparison)
 
 ## Yet To Implement
 
-### 1. Skip unchanged files during initial index (Easy)
-- Before processing a file, check if all its chunk node IDs already exist in FAISS
-- Skip files whose content hash hasn't changed since last index
-- Avoids re-embedding files that are already in the index
-
-### 2. Git history indexing (Medium)
+### 1. Git history indexing (Medium)
 - Index commit SHAs, changed files per commit
 - Use `gitpython` to walk recent commit history
 - Enable queries like "when was authentication last changed?"
 
-### 3. Custom embedding model (Hard)
+### 2. Custom embedding model (Hard)
 - Fine-tune embedding model on agent session traces
 - Use LLM-ranked relevance from real coding tasks as training signal
 - Requires: training data pipeline, GPU infrastructure

@@ -284,7 +284,7 @@ async def index_codebase(
 
     # Mark as indexing and kick off background task
     _snap.set_codebase_indexing(abs_path, 0)
-    asyncio.get_event_loop().create_task(background_indexing(_ctx, _snap, abs_path, force))
+    asyncio.get_event_loop().create_task(background_indexing(_ctx, _snap, abs_path, force, _sync))
 
     return (
         f"Indexing started for '{abs_path}'.\n"
@@ -298,16 +298,16 @@ async def index_codebase(
 async def search_code(
     path: str,
     query: str,
-    limit: int = 10,
     extensionFilter: Optional[list[str]] = None,
+    compact: bool = False,
 ) -> str:
     """Search an indexed codebase using natural language.
 
     Args:
         path: ABSOLUTE path to the indexed codebase directory.
         query: Natural language search query.
-        limit: Max results to return (default 10, max 50).
         extensionFilter: Filter results by file extensions (e.g. ['.py', '.ts']).
+        compact: If true, return only file locations without code snippets (much lower token usage).
     """
     if not path:
         return "Error: 'path' is required."
@@ -317,7 +317,7 @@ async def search_code(
     if not os.path.isdir(abs_path):
         return f"Error: '{abs_path}' is not a directory."
 
-    limit = min(limit, 50)
+    limit = 5
 
     # --- Remote proxy mode: forward search to index server ---
     if _remote_proxy:
@@ -380,13 +380,15 @@ async def search_code(
         base = os.path.basename(abs_path)
         for i, r in enumerate(results, 1):
             loc = f"{r.relative_path}:{r.start_line}-{r.end_line}"
-            content = truncate(r.content)
-            lines.append(
-                f"{i}. Code snippet ({r.language}) [{base}]\n"
-                f"   Location: {loc}\n"
-                f"   Rank: {i}\n"
-                f"   Context:\n```{r.language}\n{content}\n```\n"
-            )
+            if compact:
+                lines.append(f"{i}. [{r.language}] {loc}")
+            else:
+                content = truncate(r.content)
+                lines.append(
+                    f"{i}. Code snippet ({r.language}) [{base}]\n"
+                    f"   Location: {loc}\n"
+                    f"   Context:\n```{r.language}\n{content}\n```\n"
+                )
         return "\n".join(lines)
 
     # --- Local mode ---
@@ -434,13 +436,15 @@ async def search_code(
     base = os.path.basename(abs_path)
     for i, r in enumerate(results, 1):
         loc = f"{r.relative_path}:{r.start_line}-{r.end_line}"
-        content = truncate(r.content)
-        lines.append(
-            f"{i}. Code snippet ({r.language}) [{base}]\n"
-            f"   Location: {loc}\n"
-            f"   Rank: {i}\n"
-            f"   Context:\n```{r.language}\n{content}\n```\n"
-        )
+        if compact:
+            lines.append(f"{i}. [{r.language}] {loc}")
+        else:
+            content = truncate(r.content)
+            lines.append(
+                f"{i}. Code snippet ({r.language}) [{base}]\n"
+                f"   Location: {loc}\n"
+                f"   Context:\n```{r.language}\n{content}\n```\n"
+            )
     return "\n".join(lines)
 
 

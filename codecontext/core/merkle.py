@@ -70,8 +70,103 @@ class MerkleSynchronizer:
         self._saved_tree = self._load_snapshot()
 
     def build_tree(self) -> MerkleNode:
-        """Build a fresh Merkle tree of the codebase."""
-        return self._build_node(self.root_dir, "")
+        """Build a fresh Merkle tree of the codebase.
+
+        Uses a thread pool to parallelize file hashing (I/O-bound SHA-256)
+        for codebases with 100+ files.  Small repos use the simpler serial
+        path to avoid ThreadPool overhead.
+        """
+        # Phase 1: Collect all file paths (fast, single-threaded walk)
+        file_entries: list[tuple[str, str]] = []  # (full_path, rel_path)
+        dir_structure: dict[str, list[str]] = {}
+
+        self._walk_tree(self.root_dir, "", file_entries, dir_structure)
+
+        # Small repos: serial hashing is faster (no thread pool overhead)
+        if len(file_entries) < 100:
+            return self._build_node(self.root_dir, "")
+
+        # Phase 2: Hash all files in parallel via thread pool
+        from concurrent.futures import ThreadPoolExecutor
+
+        max_workers = min(os.cpu_count() or 4, 16)
+        file_hashes: dict[str, str] = {}
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            full_paths = [fp for fp, _ in file_entries]
+            hashes = list(pool.map(self._hash_file, full_paths))
+            for (_, rel_path), h in zip(file_entries, hashes):
+                file_hashes[rel_path] = h
+
+        # Phase 3: Build tree bottom-up using pre-computed hashes
+        return self._build_node_cached(self.root_dir, "", file_hashes)
+
+    def _walk_tree(
+        self,
+        full_path: str,
+        rel_path: str,
+        file_entries: list[tuple[str, str]],
+        dir_structure: dict[str, list[str]],
+    ) -> None:
+        """Walk the directory tree, collecting file paths and directory structure."""
+        try:
+            entries = sorted(os.listdir(full_path))
+        except PermissionError:
+            return
+
+        children = []
+        for entry in entries:
+            child_full = os.path.join(full_path, entry)
+            child_rel = os.path.join(rel_path, entry) if rel_path else entry
+
+            if self._should_ignore(child_full, os.path.isdir(child_full)):
+                continue
+
+            children.append(entry)
+            if os.path.isfile(child_full):
+                file_entries.append((child_full, child_rel))
+            elif os.path.isdir(child_full):
+                self._walk_tree(child_full, child_rel, file_entries, dir_structure)
+
+        dir_structure[rel_path] = children
+
+    def _build_node_cached(
+        self,
+        full_path: str,
+        rel_path: str,
+        file_hashes: dict[str, str],
+    ) -> MerkleNode:
+        """Build Merkle node using pre-computed file hashes (no I/O)."""
+        if os.path.isfile(full_path):
+            return MerkleNode(
+                path=rel_path,
+                hash=file_hashes.get(rel_path, ""),
+                is_dir=False,
+            )
+
+        children: dict[str, MerkleNode] = {}
+        try:
+            entries = sorted(os.listdir(full_path))
+        except PermissionError:
+            return MerkleNode(path=rel_path, hash="", is_dir=True)
+
+        for entry in entries:
+            child_full = os.path.join(full_path, entry)
+            child_rel = os.path.join(rel_path, entry) if rel_path else entry
+
+            if self._should_ignore(child_full, os.path.isdir(child_full)):
+                continue
+
+            child_node = self._build_node_cached(child_full, child_rel, file_hashes)
+            children[entry] = child_node
+
+        hasher = hashlib.sha256()
+        for name in sorted(children.keys()):
+            hasher.update(name.encode())
+            hasher.update(children[name].hash.encode())
+        dir_hash = hasher.hexdigest()
+
+        return MerkleNode(path=rel_path, hash=dir_hash, is_dir=True, children=children)
 
     async def check_for_changes(self) -> dict[str, list[str]]:
         """
@@ -244,16 +339,32 @@ class MerkleSynchronizer:
         if name.startswith("."):
             return True
 
+        # Use compiled regex for fast matching (built lazily once)
+        compiled = self._get_compiled_ignore()
+        if compiled is not None and (compiled.search(rel) or compiled.search(name)):
+            return True
+
         for pattern in self.ignore_patterns:
             if is_dir and pattern == name:
-                return True
-            if fnmatch(rel, pattern):
-                return True
-            if fnmatch(name, pattern):
                 return True
             if pattern.endswith("/**") and rel.startswith(pattern[:-3]):
                 return True
         return False
+
+    def _get_compiled_ignore(self):
+        """Lazily compile ignore patterns into a single regex."""
+        if not hasattr(self, "_compiled_ignore_re"):
+            import re
+            from fnmatch import translate
+            parts = []
+            for pat in self.ignore_patterns:
+                if not pat.endswith("/**"):
+                    parts.append(translate(pat))
+            if parts:
+                self._compiled_ignore_re = re.compile("|".join(parts))
+            else:
+                self._compiled_ignore_re = None
+        return self._compiled_ignore_re
 
     # ------------------------------------------------------------------
     # Persistence

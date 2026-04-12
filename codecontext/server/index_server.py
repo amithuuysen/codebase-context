@@ -4,6 +4,8 @@ Architecture:
   - User sends files from local machine to this server
   - Server indexes them into FAISS + BM25
   - User searches via their local MCP proxy
+  - SimHash-based index reuse: new users get a copy of a similar teammate's
+    index instead of indexing from scratch (Architecture §4)
 
 Endpoints:
   POST /api/upload       — Upload files for indexing
@@ -12,12 +14,15 @@ Endpoints:
   GET  /api/status/:id   — Get indexing status
   GET  /api/collections  — List all indexed codebases
   DELETE /api/clear/:id  — Clear an index
+  POST /api/register-simhash  — Register SimHash for a workspace
+  POST /api/find-similar      — Find the most similar existing index
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import json as _json
 import logging
 import os
 import shutil
@@ -37,6 +42,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from codecontext.core.context import Context
 from codecontext.core.embedding import create_embedding
 from codecontext.core.reranker import Reranker
+from codecontext.core.simhash import compute_simhash_from_directory, simhash_similarity
 from codecontext.core.splitter import AstSplitter
 from codecontext.core.types import Config
 from codecontext.core.vectordb import FaissVectorDB
@@ -53,11 +59,102 @@ _upload_staging: dict[str, str] = {}
 # Indexing tasks: {workspace_id: {"status": str, "progress": int, ...}}
 _index_status: dict[str, dict[str, Any]] = {}
 
+# SimHash registry: {workspace_id: simhash_hex_string}
+# Persisted to <data_dir>/simhash_registry.json
+_simhash_registry: dict[str, str] = {}
+
+# Similarity threshold for index reuse (Architecture §4: ~92% for teammates)
+_SIMHASH_REUSE_THRESHOLD = 0.85
 
 def _get_ctx() -> Context:
     if _ctx is None:
         raise RuntimeError("Server not initialized")
     return _ctx
+
+
+# ---------------------------------------------------------------------------
+# SimHash registry persistence
+# ---------------------------------------------------------------------------
+
+def _simhash_registry_path() -> Path:
+    return Path(_cfg.data_dir) / "simhash_registry.json"  # type: ignore
+
+
+def _load_simhash_registry() -> None:
+    """Load SimHash registry from disk."""
+    global _simhash_registry
+    path = _simhash_registry_path()
+    if path.exists():
+        try:
+            with open(path) as f:
+                _simhash_registry = _json.load(f)
+            logger.info("Loaded SimHash registry: %d entries", len(_simhash_registry))
+        except Exception as exc:
+            logger.warning("Failed to load SimHash registry: %s", exc)
+            _simhash_registry = {}
+
+
+def _save_simhash_registry() -> None:
+    """Persist SimHash registry to disk."""
+    path = _simhash_registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        _json.dump(_simhash_registry, f, indent=2)
+
+
+def _find_similar_index(simhash: str, exclude_workspace: str | None = None) -> tuple[str | None, float]:
+    """Find the most similar existing index by SimHash comparison.
+
+    Returns (workspace_id, similarity) of the best match, or (None, 0.0)
+    if no match exceeds the reuse threshold.
+    """
+    best_ws: str | None = None
+    best_sim = 0.0
+
+    for ws_id, ws_hash in _simhash_registry.items():
+        if ws_id == exclude_workspace:
+            continue
+        # Only consider workspaces that are actually indexed
+        status = _index_status.get(ws_id, {})
+        if status.get("status") != "indexed":
+            continue
+
+        sim = simhash_similarity(simhash, ws_hash)
+        if sim > best_sim:
+            best_sim = sim
+            best_ws = ws_id
+
+    if best_sim >= _SIMHASH_REUSE_THRESHOLD:
+        return best_ws, best_sim
+    return None, best_sim
+
+
+def _copy_index(source_workspace: str, target_workspace: str, target_staging_dir: str) -> bool:
+    """Copy FAISS + BM25 index from source to target workspace.
+
+    Returns True if the copy succeeded.
+    """
+    ctx = _get_ctx()
+    source_staging = _upload_staging.get(source_workspace)
+    if not source_staging:
+        return False
+
+    source_col = ctx.get_collection_name(source_staging)
+    target_col = ctx.get_collection_name(target_staging_dir)
+
+    # Copy FAISS collection
+    if not ctx.vector_db.copy_collection(source_col, target_col):
+        return False
+
+    # Copy BM25 index file if it exists
+    bm25_dir = Path(ctx._cfg.data_dir) / "bm25_store"
+    source_bm25 = bm25_dir / f"{source_col}.json"
+    target_bm25 = bm25_dir / f"{target_col}.json"
+    if source_bm25.exists():
+        shutil.copy2(source_bm25, target_bm25)
+        logger.info("Copied BM25 index %s → %s", source_col, target_col)
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +297,13 @@ async def trigger_index(request: Request) -> JSONResponse:
 
 
 async def _background_index(workspace_id: str, staging_dir: str, force: bool) -> None:
-    """Background task: index the staged files."""
+    """Background task: index the staged files.
+
+    Architecture §4 — Index Reuse: Before indexing from scratch, compute
+    a SimHash of the staged files and check if a similar index already
+    exists on this server. If so, copy it as a starting point and only
+    re-index the files that differ.
+    """
     ctx = _get_ctx()
     try:
         def progress_cb(phase: str, current: int, total: int, pct: int) -> None:
@@ -213,17 +316,61 @@ async def _background_index(workspace_id: str, staging_dir: str, force: bool) ->
                 "started": _index_status[workspace_id].get("started", time.time()),
             }
 
+        reused_from: str | None = None
+
+        # --- SimHash-based index reuse (Architecture §4) ---
+        if not force:
+            _index_status[workspace_id]["phase"] = "computing_simhash"
+            simhash = compute_simhash_from_directory(
+                staging_dir,
+                supported_extensions=ctx.get_supported_extensions(),
+            )
+            # Register this workspace's SimHash
+            _simhash_registry[workspace_id] = simhash
+            _save_simhash_registry()
+            logger.info("Workspace %s SimHash: %s", workspace_id, simhash[:16])
+
+            # Find a similar existing index
+            similar_ws, similarity = _find_similar_index(simhash, exclude_workspace=workspace_id)
+            if similar_ws is not None:
+                _index_status[workspace_id]["phase"] = "copying_index"
+                logger.info(
+                    "Found similar index: %s (%.1f%% similar) — copying as starting point",
+                    similar_ws, similarity * 100,
+                )
+                if _copy_index(similar_ws, workspace_id, staging_dir):
+                    reused_from = similar_ws
+                    logger.info(
+                        "Index copied from %s. Will re-index only changed files.",
+                        similar_ws,
+                    )
+                else:
+                    logger.warning("Index copy failed, proceeding with full index")
+
+        # --- Index (full or incremental over the copied base) ---
         result = await ctx.index_codebase(
             staging_dir, progress=progress_cb, force_reindex=force
         )
 
-        _index_status[workspace_id] = {
+        # Register/update SimHash after successful indexing
+        if force or workspace_id not in _simhash_registry:
+            simhash = compute_simhash_from_directory(
+                staging_dir,
+                supported_extensions=ctx.get_supported_extensions(),
+            )
+            _simhash_registry[workspace_id] = simhash
+            _save_simhash_registry()
+
+        status_data: dict[str, Any] = {
             "status": "indexed",
             "progress": 100,
             "result": result,
             "completed": time.time(),
             "started": _index_status[workspace_id].get("started", time.time()),
         }
+        if reused_from:
+            status_data["reused_from"] = reused_from
+        _index_status[workspace_id] = status_data
 
         logger.info("Indexing complete for workspace %s: %s", workspace_id, result)
     except Exception as exc:
@@ -234,6 +381,87 @@ async def _background_index(workspace_id: str, staging_dir: str, force: bool) ->
             "completed": time.time(),
             "started": _index_status[workspace_id].get("started", time.time()),
         }
+
+
+async def register_simhash(request: Request) -> JSONResponse:
+    """Register or update a workspace's SimHash fingerprint.
+
+    Expects JSON body:
+    {
+        "workspace_id": "my-project",
+        "simhash": "a3f2c1..."   // optional — if omitted, computed from staged files
+    }
+    """
+    body = await request.json()
+    workspace_id = body.get("workspace_id")
+    if not workspace_id:
+        return JSONResponse({"error": "workspace_id required"}, status_code=400)
+
+    simhash = body.get("simhash")
+    if not simhash:
+        # Compute from staged files
+        staging_dir = _upload_staging.get(workspace_id)
+        if not staging_dir or not os.path.isdir(staging_dir):
+            return JSONResponse(
+                {"error": f"No staged files for '{workspace_id}'. Upload files or provide simhash."},
+                status_code=400,
+            )
+        ctx = _get_ctx()
+        simhash = compute_simhash_from_directory(
+            staging_dir, supported_extensions=ctx.get_supported_extensions()
+        )
+
+    _simhash_registry[workspace_id] = simhash
+    _save_simhash_registry()
+
+    return JSONResponse({
+        "workspace_id": workspace_id,
+        "simhash": simhash,
+        "registry_size": len(_simhash_registry),
+    })
+
+
+async def find_similar(request: Request) -> JSONResponse:
+    """Find the most similar existing index for a workspace.
+
+    Expects JSON body:
+    {
+        "workspace_id": "new-user-project",
+        "simhash": "a3f2c1..."   // optional — looked up from registry if omitted
+    }
+
+    Returns the best matching workspace and similarity score.
+    """
+    body = await request.json()
+    workspace_id = body.get("workspace_id")
+    if not workspace_id:
+        return JSONResponse({"error": "workspace_id required"}, status_code=400)
+
+    simhash = body.get("simhash") or _simhash_registry.get(workspace_id)
+    if not simhash:
+        return JSONResponse(
+            {"error": f"No SimHash for '{workspace_id}'. Register it first or provide simhash."},
+            status_code=400,
+        )
+
+    match_ws, similarity = _find_similar_index(simhash, exclude_workspace=workspace_id)
+
+    result: dict[str, Any] = {
+        "workspace_id": workspace_id,
+        "simhash": simhash,
+        "threshold": _SIMHASH_REUSE_THRESHOLD,
+    }
+    if match_ws:
+        result["match"] = {
+            "workspace_id": match_ws,
+            "similarity": round(similarity, 4),
+            "simhash": _simhash_registry.get(match_ws, ""),
+        }
+    else:
+        result["match"] = None
+        result["best_similarity"] = round(similarity, 4)
+
+    return JSONResponse(result)
 
 
 async def search(request: Request) -> JSONResponse:
@@ -327,6 +555,11 @@ async def clear(request: Request) -> JSONResponse:
     ctx = _get_ctx()
     await ctx.clear_index(staging_dir)
     _index_status.pop(workspace_id, None)
+
+    # Remove from SimHash registry
+    if workspace_id in _simhash_registry:
+        _simhash_registry.pop(workspace_id)
+        _save_simhash_registry()
 
     # Clean up staging directory
     shutil.rmtree(staging_dir, ignore_errors=True)
@@ -582,6 +815,9 @@ def create_app(cfg: Config | None = None) -> Starlette:
         vector_db=vector_db, splitter=splitter, config=_cfg, reranker=reranker
     )
 
+    # Load SimHash registry from disk (Architecture §4)
+    _load_simhash_registry()
+
     routes = [
         Route("/api/upload", upload_files, methods=["POST"]),
         Route("/api/upload-json", upload_files_json, methods=["POST"]),
@@ -590,6 +826,9 @@ def create_app(cfg: Config | None = None) -> Starlette:
         Route("/api/status/{workspace_id}", get_status, methods=["GET"]),
         Route("/api/collections", list_collections, methods=["GET"]),
         Route("/api/clear/{workspace_id}", clear, methods=["DELETE"]),
+        # SimHash-based index reuse (Architecture §4)
+        Route("/api/register-simhash", register_simhash, methods=["POST"]),
+        Route("/api/find-similar", find_similar, methods=["POST"]),
     ]
 
     # Use MCP's Starlette app as the primary app (it manages the task group

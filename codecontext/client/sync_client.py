@@ -24,6 +24,7 @@ from typing import Any
 
 import httpx
 
+from codecontext.core.simhash import compute_simhash_from_directory
 from codecontext.core.types import DEFAULT_IGNORE_PATTERNS, DEFAULT_SUPPORTED_EXTENSIONS
 
 logger = logging.getLogger("codecontext.client")
@@ -97,7 +98,18 @@ class SyncClient:
         upload_result = await self._upload_files(files)
         logger.info("Upload complete: %s", upload_result)
 
-        # Step 3: Trigger indexing
+        # Step 3: Register SimHash for index reuse (Architecture §4)
+        # Allows server to copy a similar teammate's index as starting point
+        simhash = compute_simhash_from_directory(
+            self.codebase_path, supported_extensions=self.extensions
+        )
+        try:
+            await self._register_simhash(simhash)
+            logger.info("SimHash registered: %s", simhash[:16])
+        except Exception as exc:
+            logger.warning("SimHash registration failed (non-fatal): %s", exc)
+
+        # Step 4: Trigger indexing
         index_result = await self._trigger_index(force)
         logger.info("Indexing triggered: %s", index_result)
 
@@ -248,6 +260,31 @@ class SyncClient:
                 "workspace_id": self.workspace_id,
                 "force": force,
             },
+
+    async def _register_simhash(self, simhash: str) -> dict[str, Any]:
+        """Register this workspace's SimHash on the server for index reuse."""
+        resp = await self._client.post(
+            f"{self.server_url}/api/register-simhash",
+            json={
+                "workspace_id": self.workspace_id,
+                "simhash": simhash,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def find_similar(self) -> dict[str, Any]:
+        """Check if a similar index exists on the server.
+
+        Returns match info including workspace_id and similarity score,
+        or None if no match above threshold.
+        """
+        resp = await self._client.post(
+            f"{self.server_url}/api/find-similar",
+            json={"workspace_id": self.workspace_id},
+        )
+        resp.raise_for_status()
+        return resp.json()
         )
         resp.raise_for_status()
         return resp.json()

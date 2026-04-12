@@ -12,12 +12,17 @@ import logging
 from codecontext.core.context import Context
 from codecontext.core.sync import FileSynchronizer  # noqa: F401 (used in background_indexing)
 from .snapshot import SnapshotManager
+from .sync import SyncManager
 
 logger = logging.getLogger(__name__)
 
 
 async def background_indexing(
-    ctx: Context, snap: SnapshotManager, abs_path: str, force: bool
+    ctx: Context,
+    snap: SnapshotManager,
+    abs_path: str,
+    force: bool,
+    sync_manager: SyncManager | None = None,
 ) -> None:
     """Run indexing in the background (mirrors TS startBackgroundIndexing)."""
     try:
@@ -60,6 +65,11 @@ async def background_indexing(
             abs_path, result["indexed_files"], result.get("total_files", result["indexed_files"]),
             result.get("skipped_files", 0), result["total_chunks"], result["status"],
         )
+
+        # Start background sync (5-min interval) after first successful index
+        # so only changed files are re-indexed automatically from now on.
+        if sync_manager is not None:
+            sync_manager.start_background_sync()
     except Exception as exc:
         pct = snap.get_indexing_progress(abs_path) or 0
         snap.set_codebase_index_failed(abs_path, str(exc), last_pct=pct)

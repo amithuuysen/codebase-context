@@ -29,6 +29,7 @@ class SyncManager:
         self._ctx = context
         self._snap = snapshot
         self._is_syncing = False
+        self._background_started = False
 
     async def handle_sync_index(self) -> None:
         """Sync all indexed codebases with filesystem changes."""
@@ -56,7 +57,17 @@ class SyncManager:
             self._is_syncing = False
 
     def start_background_sync(self, interval: int = 300) -> None:
-        """Kick off two-phase background sync (mirrors TS startBackgroundSync)."""
+        """Kick off two-phase background sync (mirrors TS startBackgroundSync).
+
+        Phase 1: initial sync after 5 s.
+        Phase 2: periodic sync every *interval* seconds (default 300 = 5 min).
+        Only starts once — subsequent calls are no-ops.
+        """
+        if self._background_started:
+            return
+        self._background_started = True
+        logger.info("Starting background sync (interval=%ds)", interval)
+
         async def _phase1():
             await asyncio.sleep(5)
             try:
@@ -72,5 +83,5 @@ class SyncManager:
                 except Exception:
                     pass
 
-        asyncio.get_event_loop().create_task(_phase1())
-        asyncio.get_event_loop().create_task(_phase2())
+        asyncio.ensure_future(_phase1())
+        asyncio.ensure_future(_phase2())
