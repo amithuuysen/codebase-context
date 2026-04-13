@@ -59,11 +59,12 @@ class MerkleSynchronizer:
     Persistence: serialized to ~/.context/merkle/<hash>.json
     """
 
-    def __init__(self, root_dir: str, ignore_patterns: list[str] | None = None):
+    def __init__(self, root_dir: str, ignore_patterns: list[str] | None = None, merkle_dir: Path | None = None):
         self.root_dir = os.path.abspath(root_dir)
         self.ignore_patterns = ignore_patterns or []
         self._saved_tree: MerkleNode | None = None
-        self._snapshot_path = self._get_snapshot_path(self.root_dir)
+        self._merkle_dir = merkle_dir or MERKLE_DIR
+        self._snapshot_path = self._get_snapshot_path(self.root_dir, self._merkle_dir)
 
     async def initialize(self) -> None:
         """Load the previously saved Merkle tree from disk."""
@@ -371,15 +372,16 @@ class MerkleSynchronizer:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _get_snapshot_path(root_dir: str) -> str:
+    def _get_snapshot_path(root_dir: str, merkle_dir: Path | None = None) -> str:
+        d = merkle_dir or MERKLE_DIR
         h = hashlib.md5(os.path.abspath(root_dir).encode()).hexdigest()
-        MERKLE_DIR.mkdir(parents=True, exist_ok=True)
-        return str(MERKLE_DIR / f"merkle_{h}.json")
+        d.mkdir(parents=True, exist_ok=True)
+        return str(d / f"merkle_{h}.json")
 
     def _save_snapshot(self, tree: MerkleNode) -> None:
         try:
             data = self._serialize_node(tree)
-            MERKLE_DIR.mkdir(parents=True, exist_ok=True)
+            self._merkle_dir.mkdir(parents=True, exist_ok=True)
             with open(self._snapshot_path, "w") as f:
                 json.dump(data, f)
         except Exception as exc:
@@ -397,8 +399,8 @@ class MerkleSynchronizer:
             return None
 
     @staticmethod
-    async def delete_snapshot(root_dir: str) -> None:
-        sp = MerkleSynchronizer._get_snapshot_path(root_dir)
+    async def delete_snapshot(root_dir: str, merkle_dir: Path | None = None) -> None:
+        sp = MerkleSynchronizer._get_snapshot_path(root_dir, merkle_dir)
         if os.path.exists(sp):
             os.remove(sp)
 

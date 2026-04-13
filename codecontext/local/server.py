@@ -43,6 +43,8 @@ def _build_context(cfg: Config) -> Context:
             emb_kwargs["base_url"] = cfg.openai_base_url
     elif cfg.embedding_provider == "ollama":
         emb_kwargs["host"] = cfg.ollama_host
+    elif cfg.embedding_provider == "llamacpp":
+        emb_kwargs["model"] = cfg.llamacpp_model_path
     embed_model = create_embedding(cfg.embedding_provider, **emb_kwargs)
 
     persist_dir = Path(cfg.data_dir) / "faiss_store"

@@ -1,5 +1,247 @@
 # CodeContext — Hybrid Semantic Code Search (Python MCP Server)
 
+A Python MCP server that brings Cursor-quality hybrid semantic code search to any editor. Combines FAISS dense vector search with BM25 keyword search via Reciprocal Rank Fusion, Merkle tree incremental sync, and Tree-sitter AST-aware chunking.
+
+**Default:** Ollama + `nomic-embed-text` (local, free, no API key needed).
+
+---
+
+## Quick Start
+
+### 1. Install
+
+```bash
+cd codebase-context
+uv sync
+```
+
+### 2. Start Ollama
+
+```bash
+ollama serve &
+ollama pull nomic-embed-text
+```
+
+### 3. Start the MCP Server
+
+```bash
+# Default: streamable-http on http://127.0.0.1:8877/mcp
+uv run codecontext
+
+# Or stdio transport (for clients that spawn the process)
+MCP_TRANSPORT=stdio uv run codecontext
+```
+
+### 4. Connect Your Editor
+
+**VS Code** (`.vscode/mcp.json`) — streamable-http:
+```json
+{
+  "servers": {
+    "codecontext": {
+      "type": "http",
+      "url": "http://127.0.0.1:8877/mcp"
+    }
+  }
+}
+```
+
+**VS Code** (`.vscode/mcp.json`) — stdio:
+```json
+{
+  "servers": {
+    "codecontext": {
+      "command": "uv",
+      "args": ["run", "codecontext"],
+      "env": {
+        "MCP_TRANSPORT": "stdio"
+      }
+    }
+  }
+}
+```
+
+**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+```json
+{
+  "mcpServers": {
+    "codecontext": {
+      "command": "uv",
+      "args": ["run", "codecontext"],
+      "env": {
+        "MCP_TRANSPORT": "stdio"
+      }
+    }
+  }
+}
+```
+
+That's it. Use `index_codebase` to index a project, then `search_code` to search.
+
+---
+
+## Configuration
+
+### Embedding Providers
+
+| Provider | Model | Params | Speed (2K files, M4 Pro) | Notes |
+|----------|-------|--------|--------------------------|-------|
+| **ollama** (default) | `nomic-embed-text` | 137M | 12 files/s | Local, free, good quality |
+| **local** | `all-MiniLM-L6-v2` | 22M | 55 files/s | Fastest, fully offline |
+| **openai** | `text-embedding-3-small` | — | Cloud-speed | Requires API key |
+| **fastembed** | `BAAI/bge-small-en-v1.5` | 33M | 6.5 files/s | ONNX runtime |
+| **llamacpp** | any GGUF model | varies | 2.8 files/s | GGUF quantized models |
+
+```bash
+# Default (Ollama)
+uv run codecontext
+
+# Sentence-transformers (fastest, fully offline, no server needed)
+EMBEDDING_PROVIDER=local uv run codecontext
+
+# OpenAI
+EMBEDDING_PROVIDER=openai OPENAI_API_KEY=sk-... uv run codecontext
+
+# Custom Ollama model
+OLLAMA_MODEL=nomic-embed-text:v1.5 uv run codecontext
+
+# Custom local model (e.g. Jina v2 code embeddings)
+EMBEDDING_PROVIDER=local LOCAL_EMBEDDING_MODEL=jinaai/jina-embeddings-v2-small-en uv run codecontext
+```
+
+### Speed Up Ollama (Recommended for Large Codebases)
+
+By default, Ollama processes one embedding request at a time. For large codebases (10K+ files), configure parallel processing and Flash Attention:
+
+```bash
+# macOS — set env vars for the Ollama app
+launchctl setenv OLLAMA_NUM_PARALLEL 8
+launchctl setenv OLLAMA_FLASH_ATTENTION 1
+```
+
+Then **restart the Ollama app** (quit from menu bar → reopen).
+
+```bash
+# Linux
+OLLAMA_NUM_PARALLEL=8 OLLAMA_FLASH_ATTENTION=1 ollama serve
+```
+
+| Setting | Effect |
+|---|---|
+| `OLLAMA_NUM_PARALLEL=8` | Processes 8 embedding batches concurrently instead of 1 |
+| `OLLAMA_FLASH_ATTENTION=1` | O(N) memory instead of O(N²). 20-40% faster on long sequences |
+
+**Indexing speed comparison (21K-file Java codebase, M4 Pro):**
+
+| Configuration | Speed | Time |
+|---|---|---|
+| Default (NUM_PARALLEL=1) | ~7 files/s | ~50 min |
+| NUM_PARALLEL=8 + Flash Attention | ~17 files/s | ~21 min |
+
+> **Tip:** Use `nomic-embed-text:v1.5` over v2-moe. The v2-moe model has only 512-token context (truncates code chunks), while v1.5 supports 8K tokens.
+
+### Enable Reranker (Optional)
+
+```bash
+export RERANKER_PROVIDER=local
+export RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `MCP_TRANSPORT` | `streamable-http` | `streamable-http`, `stdio`, or `sse` |
+| `EMBEDDING_PROVIDER` | `ollama` | `openai`, `ollama`, `local`, `fastembed`, or `llamacpp` |
+| `EMBEDDING_MODEL` | auto | Model name (auto-selected per provider) |
+| `OPENAI_API_KEY` | — | Required for OpenAI provider |
+| `OPENAI_BASE_URL` | — | Custom API endpoint |
+| `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama server URL |
+| `OLLAMA_MODEL` | `nomic-embed-text` | Ollama model |
+| `OLLAMA_NUM_PARALLEL` | `1` | Concurrent embedding requests (set on Ollama server) |
+| `OLLAMA_FLASH_ATTENTION` | `0` | Enable Flash Attention on Apple Silicon (set on Ollama server) |
+| `EMBEDDING_BATCH_SIZE` | `100` | Chunks per embedding API call |
+| `LOCAL_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Sentence-transformers model |
+| `FASTEMBED_MODEL` | `BAAI/bge-small-en-v1.5` | FastEmbed ONNX model |
+| `LLAMACPP_MODEL_PATH` | — | Path to GGUF model file |
+| `CHUNK_SIZE` | `2500` | Max characters per code chunk |
+| `CHUNK_OVERLAP` | `250` | Overlap between chunks |
+| `CODECONTEXT_DATA_DIR` | `~/.context` | Data storage directory |
+| `RERANKER_PROVIDER` | `none` | `none` or `local` (enables cross-encoder) |
+| `RERANKER_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Cross-encoder model |
+| `INDEX_SERVER_URL` | — | Remote index server URL (enables proxy mode) |
+| `PORT` | `8878` | Index server listen port |
+| `SYNC_INTERVAL_SECONDS` | `300` | Background re-sync interval |
+
+---
+
+## MCP Tools
+
+| Tool | Description |
+|---|---|
+| `index_codebase` | Index a directory — scan → AST split → embed → FAISS + BM25 |
+| `search_code` | Hybrid search — FAISS + BM25 → RRF → optional rerank |
+| `clear_index` | Drop FAISS + BM25 indices and sync state for a codebase |
+| `get_indexing_status` | Check indexing progress, file/chunk counts, error state |
+
+---
+
+## Client-Server Mode (Team)
+
+For teams, run a shared index server. Clients upload files and search remotely — no local GPU needed.
+
+```
+Local Machine                    Index Server (remote :8878)
+┌──────────────────┐   files    ┌──────────────────────┐
+│ VS Code + MCP    │───────────▶│ FAISS + BM25         │
+│ codecontext      │   search   │ Ollama embedding     │
+│ (proxy mode)     │◀───results─│ SimHash team reuse   │
+└──────────────────┘            └──────────────────────┘
+```
+
+**Start the index server:**
+```bash
+uv run codecontext-server
+# Listens on 0.0.0.0:8878
+```
+
+**Connect a client:**
+```bash
+INDEX_SERVER_URL=http://your-server:8878 uv run codecontext
+```
+
+Or in `.vscode/mcp.json`:
+```json
+{
+  "servers": {
+    "codecontext": {
+      "command": "uv",
+      "args": ["run", "codecontext"],
+      "env": {
+        "MCP_TRANSPORT": "stdio",
+        "INDEX_SERVER_URL": "http://your-server:8878"
+      }
+    }
+  }
+}
+```
+
+**Index Server API:**
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/upload` | POST | Multipart file upload with `workspace_id` |
+| `/api/upload-json` | POST | Upload files as JSON (batch of 100, path traversal protected) |
+| `/api/index` | POST | Trigger background indexing for a workspace |
+| `/api/search` | POST | Semantic search (`workspace_id`, `query`, `limit` max 50) |
+| `/api/status/{workspace_id}` | GET | Check indexing progress |
+| `/api/collections` | GET | List all indexed workspaces |
+| `/api/clear/{workspace_id}` | DELETE | Delete a workspace's index |
+| `/api/register-simhash` | POST | Register workspace SimHash fingerprint |
+| `/api/find-similar` | POST | Find similar existing index for reuse |
+
+---
+
 ## Problem Statement
 
 Modern AI coding agents (Claude, Copilot, Cursor) need to understand entire codebases — not just the file currently open. The fundamental challenge is **retrieval**: given a natural-language query like *"where do we handle authentication?"*, find the most relevant code across thousands of files in milliseconds.
@@ -8,40 +250,21 @@ Existing approaches have clear limitations:
 
 | Approach | Limitation |
 |---|---|
-| **Pure grep / regex** | Cannot match by *meaning* — fails when the query uses different words than the code (e.g. "authentication" vs `session.ts`) |
-| **Pure semantic search** (embeddings) | Misses exact keyword matches — a query for `PaymentService` may return conceptually similar but wrong results |
-| **Flat file-hash sync** | Re-scans every file on every sync pass — O(total files) even when only 3 files changed in a 50K-file repo |
-| **Single-stage retrieval** | Bi-encoder embeddings are fast but imprecise; no mechanism to refine the initial ranking |
-| **GitHub Copilot (local index)** | VS Code's local workspace index is limited to **~2,500 indexable files**. Larger codebases fall back to non-semantic tools (grep, file search) unless a remote index is available |
-| **GitHub Copilot (remote index)** | Remote index only works for repos on **GitHub.com** or **GitHub Enterprise Cloud** — not supported for GitHub Enterprise Server, self-hosted Git, or non-GitHub repos. Index builds can silently fail or stall on very large repositories, and "External Ingest" for non-GitHub/Azure DevOps code requires a **paid Copilot subscription** |
-| **Cursor IDE** | Hybrid search architecture is excellent (12.5% accuracy improvement), but requires a **paid subscription** ($20/mo Pro, $40/mo Business) — the underlying search technology is proprietary and not available as a standalone tool |
+| **Pure grep / regex** | Cannot match by *meaning* — fails when query uses different words than code |
+| **Pure semantic search** | Misses exact keyword matches — `PaymentService` may return wrong results |
+| **Flat file-hash sync** | Re-scans every file on every sync — O(total files) |
+| **Single-stage retrieval** | Bi-encoder embeddings are fast but imprecise; no refinement |
+| **GitHub Copilot (local)** | Limited to ~2,500 indexable files |
+| **GitHub Copilot (remote)** | Only works for GitHub.com repos |
+| **Cursor IDE** | Excellent hybrid search, but proprietary and $20+/mo |
 
-### Why existing IDE indexing falls short
+### Solution
 
-**GitHub Copilot's indexing limitations** are well-documented in community discussions ([GitHub Discussion #152490](https://github.com/orgs/community/discussions/152490), [VS Code docs](https://code.visualstudio.com/docs/copilot/workspace-context)):
-
-- **Local index cap (~2,500 files):** For workspaces exceeding ~2,500 indexable files, Copilot cannot build a local semantic index. It falls back to text search, grep, and file search — losing the ability to find code by *meaning*. Enterprise codebases with 10K–100K+ files are left without semantic search entirely unless they use the remote index.
-- **Remote index requires GitHub.com hosting:** The remote index is built from the repository's default branch on GitHub.com or GitHub Enterprise Cloud. Repos hosted on GitHub Enterprise Server, GitLab, Bitbucket, or local Git servers **cannot use remote indexing at all**. For non-GitHub/Azure DevOps repos, an "External Ingest" feature exists but requires a paid Copilot subscription and is still gradually rolling out.
-- **Remote index build reliability:** Initial indexing can take up to 60 seconds for large repositories. Community reports indicate index builds can silently fail, stall, or produce incomplete results — with limited diagnostic visibility (the status bar shows "indexed" even when indexing is partial).
-- **No transparency on index contents:** The local index is stored in VS Code's workspace storage (`~/Library/Application Support/Code/User/workspaceStorage/` on macOS) under `GitHub.copilot-chat`, but file names and format are undocumented and can change between versions. Users have reported unexpected large uploads (~500MB) of workspace content to `api.github.com` during indexing.
-
-**Cursor IDE** solves many of these problems with its hybrid semantic + keyword search architecture, but locks the solution behind a **paid subscription** ($20/mo minimum). The search technology is proprietary and tightly coupled to the Cursor editor — it cannot be used with other editors or as a standalone service.
-
-Cursor IDE's research demonstrates that **combining semantic + keyword search improves accuracy by 12.5%** on average, and up to 23.5% on large codebases (1000+ files). Their architecture uses Merkle trees for O(changes) sync, hybrid retrieval with fusion, and a two-stage pipeline with reranking.
-
-## Proposed Solution
-
-A Python MCP server that replicates the key accuracy techniques from Cursor's architecture:
-
-1. **Hybrid Retrieval (Semantic + Keyword)** — FAISS dense vector search (finds code by meaning) combined with BM25 sparse keyword search (finds exact matches), fused via Reciprocal Rank Fusion (RRF).
-
-2. **Merkle Tree Sync** — Directory-aware change detection using cryptographic hash trees. Only walks branches where hashes diverge — unchanged subtrees are skipped entirely.
-
-3. **Two-Stage Pipeline** — Stage 1: fast recall via FAISS + BM25 + RRF to get top-N candidates. Stage 2: optional cross-encoder reranker for precision refinement on top-N → final top-K.
-
-4. **AST-Aware Chunking** — Tree-sitter parses code into an AST, splitting at logical boundaries (functions, classes) instead of arbitrary character offsets. Oversized chunks use line-by-line splitting with overlap.
-
-5. **MCP Protocol** — Exposes 4 tools (`index_codebase`, `search_code`, `clear_index`, `get_indexing_status`) over stdio, compatible with Claude Desktop, VS Code Copilot, and any MCP client.
+1. **Hybrid Retrieval** — FAISS dense vectors + BM25 sparse keywords, fused via RRF
+2. **Merkle Tree Sync** — O(changes) incremental re-indexing
+3. **Two-Stage Pipeline** — Fast recall via RRF, optional cross-encoder reranking
+4. **AST-Aware Chunking** — Tree-sitter splits at function/class boundaries
+5. **MCP Protocol** — 4 tools over stdio/HTTP, compatible with any MCP client
 
 ## Architecture
 
@@ -110,11 +333,11 @@ A Python MCP server that replicates the key accuracy techniques from Cursor's ar
 codecontext/
 ├── __init__.py
 ├── core/                          # Core search library
-│   ├── __init__.py                # Re-exports all public types/classes
-│   ├── types.py                   # Config, CodeChunk, SemanticSearchResult, constants
+│   ├── __init__.py
+│   ├── types.py                   # Config, constants, data classes
 │   ├── context.py                 # Orchestrator: index → hybrid search → rerank
-│   ├── embedding.py               # Embedding factory (OpenAI / Ollama / local)
-│   ├── embedding_cache.py         # SHA-256 content hash → embedding vector cache
+│   ├── embedding.py               # Embedding factory (ollama / local / openai / fastembed / llamacpp)
+│   ├── embedding_cache.py         # SHA-256 content hash → embedding vector cache (SQLite)
 │   ├── vectordb.py                # FAISS IndexFlatIP (dense vectors, cosine similarity)
 │   ├── bm25.py                    # BM25 sparse keyword index (inverted index + IDF)
 │   ├── hybrid_search.py           # RRF fusion (FAISS + BM25 → merged ranking)
@@ -127,23 +350,22 @@ codecontext/
 │       ├── __init__.py
 │       ├── ast_splitter.py        # Tree-sitter AST splitter (functions, classes)
 │       └── text_splitter.py       # Character-based fallback splitter
-├── mcp/                           # MCP server layer
+├── local/                         # Local MCP server
 │   ├── __init__.py
 │   ├── server.py                  # FastMCP + @mcp.tool() decorators + main()
 │   ├── handlers.py                # background_indexing() async helper
 │   ├── snapshot.py                # SnapshotManager (V2 format, indexing state)
 │   ├── sync.py                    # SyncManager (background 5-min file-change sync)
 │   └── utils.py                   # ensure_absolute, truncate, log_config, shutdown
-├── server/                        # Remote index server (HTTP API)
+├── remote/                        # Remote index server + client
 │   ├── __init__.py
-│   └── index_server.py            # Starlette ASGI app — upload, index, search
-├── client/                        # Client for remote index server
-│   ├── __init__.py
+│   ├── index_server.py            # Starlette ASGI app — upload, index, search
+│   ├── server.py                  # Remote MCP server entry point
 │   ├── sync_client.py             # SyncClient — upload files, trigger indexing, search
 │   └── remote_search.py           # RemoteSearchProxy — MCP ↔ index server bridge
 ```
 
-## Key Design Decisions
+## Design Decisions
 
 ### 1. FAISS IndexFlatIP for Cosine Similarity
 Vectors are L2-normalized before insertion. Inner product on normalized vectors equals cosine similarity, producing scores in [0, 1] where 1.0 = perfect match. Threshold default is 0.5 (matching the TypeScript/Milvus original).
@@ -161,15 +383,6 @@ For a 50K-file repo where 3 files changed:
 
 ### 5. AST Splitting Matches TypeScript Original
 Node types per language match the original TypeScript implementation exactly. Control flow statements (`if`, `for`, `while`, `try`) stay inside their parent function/class — they are NOT split into separate chunks. Gap text (imports, comments between functions) is discarded, matching the TS behavior.
-
-## MCP Tools
-
-| Tool | Description |
-|---|---|
-| `index_codebase` | Index a directory — scan → AST split → embed → FAISS + BM25 |
-| `search_code` | Hybrid search — FAISS + BM25 → RRF → optional rerank |
-| `clear_index` | Drop FAISS + BM25 indices and sync state for a codebase |
-| `get_indexing_status` | Check indexing progress, file/chunk counts, error state |
 
 ## Data Storage
 
@@ -189,233 +402,10 @@ All data persists locally under `~/.context/`:
 │   └── ollama_nomic-embed-text.db     # WAL mode, O(1) lookups, incremental writes
 ├── merkle/                            # Merkle tree snapshots
 │   └── merkle_<hash>.json             # Directory-aware tree
-├── simhash_registry.json              # SimHash fingerprints (team index reuse)eam index reuse)
+├── simhash_registry.json              # SimHash fingerprints (team index reuse)
 ├── path_obfuscation_key               # HMAC key (chmod 600)
 └── mcp-codebase-snapshot.json         # Indexing state (V2 format)
 ```
-
-## Environment Variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `MCP_TRANSPORT` | `streamable-http` | `streamable-http`, `stdio`, or `sse` |
-| `EMBEDDING_PROVIDER` | `ollama` | `openai`, `ollama`, or `local` |
-| `EMBEDDING_MODEL` | auto | Model name (auto-selected per provider) |
-| `OPENAI_API_KEY` | — | Required for OpenAI provider |
-| `OPENAI_BASE_URL` | — | Custom API endpoint |
-| `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama server URL |
-| `OLLAMA_MODEL` | `nomic-embed-text` | Ollama model |
-| `LOCAL_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Sentence-transformers model |
-| `CHUNK_SIZE` | `3000` | Max characters per code chunk |
-| `CHUNK_OVERLAP` | `300` | Overlap between chunks |
-| `EMBEDDING_BATCH_SIZE` | `100` | Chunks per embedding API call |
-| `CODECONTEXT_DATA_DIR` | `~/.context` | Data storage directory |
-| `RERANKER_PROVIDER` | `none` | `none` or `local` (enables cross-encoder) |
-| `RERANKER_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Cross-encoder model |
-| `INDEX_SERVER_URL` | — | Remote index server URL (enables proxy mode) |
-| `PORT` | `8878` | Index server listen port |
-
-## How to Run
-
-### 1. Install
-
-```bash
-cd codebase-context
-uv sync
-```
-
-### 2. Configure Embeddings
-
-```bash
-# Default: Ollama with nomic-embed-text (local, free, no API key needed)
-# Just ensure Ollama is running: ollama serve
-
-# Option A: OpenAI (requires API key)
-export EMBEDDING_PROVIDER=openai
-export OPENAI_API_KEY=sk-...
-
-# Option B: Sentence-transformers (fully offline, no API key)
-export EMBEDDING_PROVIDER=local
-```
-
-### 3. Enable Reranker (Optional)
-
-```bash
-export RERANKER_PROVIDER=local
-export RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
-```
-
----
-
-### Mode A: Local Indexing (Single Developer)
-
-Everything runs on your machine — embedding, FAISS, BM25, search. No network calls.
-
-```
-┌──────────────────────────────────────────────────┐
-│                 Your Machine                      │
-│                                                   │
-│  VS Code / Claude Desktop                         │
-│       │ MCP (stdio)                               │
-│       ▼                                           │
-│  codecontext (MCP server)                         │
-│       │                                           │
-│       ├── Ollama (nomic-embed-text)               │
-│       ├── FAISS + BM25 index (~/.context/)        │
-│       └── Merkle tree sync                        │
-└──────────────────────────────────────────────────┘
-```
-
-**Run the MCP server:**
-```bash
-# Default: streamable-http on http://127.0.0.1:8877/mcp
-uv run codecontext
-
-# Or use stdio transport (for clients that spawn the process)
-MCP_TRANSPORT=stdio uv run codecontext
-```
-
-**VS Code** (`.vscode/mcp.json`) — streamable-http:
-```json
-{
-  "servers": {
-    "codecontext": {
-      "type": "http",
-      "url": "http://127.0.0.1:8877/mcp"
-    }
-  }
-}
-```
-
-**VS Code** (`.vscode/mcp.json`) — stdio:
-```json
-{
-  "servers": {
-    "codecontext": {
-      "command": "uv",
-      "args": ["run", "codecontext"],
-      "env": {
-        "MCP_TRANSPORT": "stdio"
-      }
-    }
-  }
-}
-```
-
-**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
-```json
-{
-  "mcpServers": {
-    "codecontext": {
-      "command": "uv",
-      "args": ["run", "codecontext"],
-      "env": {
-        "MCP_TRANSPORT": "stdio"
-      }
-    }
-  }
-}
-```
-
-> No `EMBEDDING_PROVIDER` or `OLLAMA_MODEL` needed — defaults to Ollama + nomic-embed-text. Just ensure `ollama serve` is running.
-
----
-
-### Mode B: Remote Index Server
-
-Index server runs on a separate machine. User sends files to it and searches remotely — no local GPU needed on the client.
-
-```
-Local Machine                    Index Server (remote :8878)
-┌──────────────────┐   files    ┌──────────────────────┐
-│ VS Code + MCP    │───────────▶│ FAISS + BM25         │
-│ codecontext      │   JSON     │ Ollama embedding     │
-│ (proxy mode)     │◀───search──│ Merkle tree sync     │
-│                  │   results  │                      │
-└──────────────────┘            └──────────────────────┘
-```
-
-#### Step 1: Start the index server (on your shared/remote machine)
-
-```bash
-# Install and run on the server
-cd codebase-context
-uv sync
-
-# Start with Ollama (ensure ollama serve is running on the server)
-uv run codecontext-server
-# Listens on 0.0.0.0:8878
-
-# Or with a custom port
-PORT=9000 uv run codecontext-server
-
-# Or with OpenAI embeddings on the server side
-EMBEDDING_PROVIDER=openai OPENAI_API_KEY=sk-... uv run codecontext-server
-```
-
-#### Step 2: Upload and index from a client (programmatic)
-
-```python
-from codecontext.client import SyncClient
-
-client = SyncClient("http://index-server:8878", "/path/to/codebase")
-await client.sync()                              # Upload + index
-results = await client.search("auth handler")    # Search remote
-```
-
-#### Step 3: Connect VS Code / Claude Desktop to the remote index
-
-When `INDEX_SERVER_URL` is set, the MCP server becomes a thin proxy — it forwards `search_code` queries to the remote index server instead of running local FAISS.
-
-**VS Code** (`.vscode/mcp.json`):
-```json
-{
-  "servers": {
-    "codecontext": {
-      "command": "uv",
-      "args": ["run", "codecontext"],
-      "env": {
-        "MCP_TRANSPORT": "stdio",
-        "INDEX_SERVER_URL": "http://your-server:8878"
-      }
-    }
-  }
-}
-```
-
-**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
-```json
-{
-  "mcpServers": {
-    "codecontext": {
-      "command": "uv",
-      "args": ["run", "codecontext"],
-      "env": {
-        "MCP_TRANSPORT": "stdio",
-        "INDEX_SERVER_URL": "http://your-server:8878"
-      }
-    }
-  }
-}
-```
-
-> **No Ollama needed on client machines.** The index server handles all embedding and search. Clients only need `uv` and the `codecontext` package installed.
-
-#### Index Server API
-
-| Endpoint | Method | Description |
-|---|---|---|
-| `/api/upload` | POST | Multipart file upload with `workspace_id` |
-| `/api/upload-json` | POST | Upload files as JSON (batch of 100, path traversal protected) |
-| `/api/index` | POST | Trigger background indexing for a workspace (`force` option) |
-| `/api/search` | POST | Semantic search (`workspace_id`, `query`, `limit` max 50) |
-| `/api/status/{workspace_id}` | GET | Check indexing progress |
-| `/api/collections` | GET | List all indexed workspaces |
-| `/api/clear/{workspace_id}` | DELETE | Delete a workspace's index + SimHash entry |
-| `/api/register-simhash` | POST | Register/update workspace SimHash fingerprint |
-| `/api/find-similar` | POST | Find similar existing index for reuse |
-
-The index server also exposes MCP tools at `/mcp` — same 4 tools as local mode (`index_codebase`, `search_code`, `clear_index`, `get_indexing_status`).
 
 ---
 
@@ -586,149 +576,7 @@ The index server also exposes MCP tools at `/mcp` — same 4 tools as local mode
 
 ---
 
-## Client-Server Model
-
-CodeContext supports two deployment modes: **local** (single developer) and **client-server** (team).
-
-### Local Mode (Default)
-
-Everything runs on one machine — embedding, indexing, search, and the MCP server.
-
-```
-┌──────────────────────────────────────────────────┐
-│                 Your Machine                      │
-│                                                   │
-│  VS Code / Claude Desktop                         │
-│       │ MCP (stdio or streamable-http)            │
-│       ▼                                           │
-│  codecontext (MCP server, port 8877)              │
-│       │                                           │
-│       ├── Ollama (nomic-embed-text, port 11434)   │
-│       ├── FAISS + BM25 index (~/.context/)        │
-│       ├── Embedding cache (SQLite)                │
-│       ├── Merkle tree sync (every 5 min)          │
-│       └── AST splitter (Tree-sitter)              │
-└──────────────────────────────────────────────────┘
-```
-
-**Prerequisites:** `uv`, Ollama running with `nomic-embed-text` pulled.
-
-### Client-Server Mode (Team)
-
-The index server centralizes embedding and search. Clients upload files and query remotely — no local GPU or Ollama needed on client machines.
-
-```
-┌─ Client Machines ────────┐            ┌─ Index Server (:8878) ─────────┐
-│                          │            │                                │
-│  VS Code + MCP           │   files    │  Ollama (embedding)            │
-│  codecontext             │───────────▶│  FAISS + BM25 (per workspace)  │
-│  (proxy mode)            │   search   │  Embedding cache (SQLite)      │
-│                          │◀───results─│  SimHash registry (team reuse) │
-│  No Ollama needed        │            │  Background sync (5 min)       │
-│  No GPU needed           │            │  Merkle tree sync              │
-└──────────────────────────┘            └────────────────────────────────┘
-```
-
-**How proxy mode works:** When `INDEX_SERVER_URL` is set, the MCP server becomes a thin proxy:
-1. `index_codebase` → uploads files to the index server, triggers remote indexing
-2. `search_code` → forwards query to the remote index server
-3. `clear_index` → clears remote index
-4. `get_indexing_status` → polls remote status
-
-The client never runs an embedding model — all heavy computation happens on the server.
-
-**SimHash team reuse:** When a new developer connects, the server computes their codebase SimHash and checks if a similar index already exists (≥85% similarity). If found, it copies the existing index and only re-indexes the differences — reducing median indexing from ~8 seconds to ~500ms.
-
----
-
-## Startup Guide
-
-### Quick Start (Local Mode — Single Developer)
-
-```bash
-# 1. Clone and install
-git clone <repo-url> codebase-context
-cd codebase-context
-uv sync
-
-# 2. Start Ollama (if not already running)
-ollama serve &
-ollama pull nomic-embed-text
-
-# 3. Start the MCP server
-uv run codecontext
-# → Listening on http://127.0.0.1:8877/mcp (streamable-http)
-
-# 4. Configure your editor (see Mode A section above)
-```
-
-That's it. Open your editor, use `index_codebase` to index a project, then `search_code` to search.
-
-### Quick Start (Client-Server Mode — Team)
-
-**On the server machine:**
-```bash
-# 1. Install
-cd codebase-context && uv sync
-
-# 2. Start Ollama
-ollama serve &
-ollama pull nomic-embed-text
-
-# 3. Start the index server
-uv run codecontext-server
-# → Listening on 0.0.0.0:8878
-```
-
-**On each developer machine:**
-```bash
-# 1. Install (no Ollama needed)
-cd codebase-context && uv sync
-
-# 2. Start MCP server in proxy mode
-INDEX_SERVER_URL=http://your-server:8878 uv run codecontext
-```
-
-Or configure it in `.vscode/mcp.json`:
-```json
-{
-  "servers": {
-    "codecontext": {
-      "command": "uv",
-      "args": ["run", "codecontext"],
-      "env": {
-        "MCP_TRANSPORT": "stdio",
-        "INDEX_SERVER_URL": "http://your-server:8878"
-      }
-    }
-  }
-}
-```
-
-### Verifying It Works
-
-```bash
-# Check server health
-curl http://localhost:8878/api/collections
-
-# Index programmatically
-python -c "
-import asyncio
-from codecontext.client import SyncClient
-async def go():
-    c = SyncClient('http://localhost:8878', '/path/to/codebase')
-    await c.sync()
-    results = await c.search('authentication handler')
-    for r in results:
-        print(f\"  {r['relative_path']}:{r['start_line']} (score={r['score']:.3f})\")
-    await c.close()
-asyncio.run(go())
-"
-```
-
----
-
-## Problem-Solving Techniques
+## Troubleshooting
 
 ### Problem: "Indexing is slow on first run"
 
@@ -783,17 +631,12 @@ EMBEDDING_PROVIDER=openai OPENAI_API_KEY=sk-... uv run codecontext
 
 ---
 
-### 4. Run Tests
+## Tests
 
 ```bash
-# Core pipeline tests
-uv run python test_components.py
-
-# Accuracy validation (AST splitting, cosine similarity, etc.)
-uv run python test_accuracy.py
-
-# Hybrid architecture tests (BM25, RRF, Merkle tree, reranker)
-uv run python test_hybrid.py
+uv run python test_components.py    # Core pipeline
+uv run python test_accuracy.py      # AST splitting, cosine similarity
+uv run python test_hybrid.py        # BM25, RRF, Merkle tree, reranker
 ```
 
 ## Pricing Comparison (2026)

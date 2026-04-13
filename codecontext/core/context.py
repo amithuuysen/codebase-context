@@ -183,6 +183,7 @@ class Context:
         codebase_path: str,
         progress: ProgressCallback | None = None,
         force_reindex: bool = False,
+        max_files: int = 0,
     ) -> dict[str, Any]:
         """
         Full pipeline:
@@ -202,6 +203,9 @@ class Context:
         _report(progress, "Scanning files…", 5, 100, 5)
         files = self._get_code_files(codebase_path)
         logger.info("Found %d code files", len(files))
+        if max_files > 0 and len(files) > max_files:
+            files = files[:max_files]
+            logger.info("Capped to %d files (--max-files)", max_files)
         if not files:
             _report(progress, "No files to index", 100, 100, 100)
             return {"indexed_files": 0, "total_chunks": 0, "status": "completed"}
@@ -214,7 +218,7 @@ class Context:
         if not force_reindex and self.vector_db.has_collection(col):
             merkle = self._merkle_synchronizers.get(col)
             if merkle is None:
-                merkle = MerkleSynchronizer(codebase_path, self.ignore_patterns)
+                merkle = MerkleSynchronizer(codebase_path, self.ignore_patterns, merkle_dir=Path(self._cfg.data_dir) / "merkle")
                 await merkle.initialize()
                 self._merkle_synchronizers[col] = merkle
             if merkle._saved_tree is not None:
@@ -251,7 +255,7 @@ class Context:
         # Merkle tree sync (Cursor-style directory-aware change detection)
         merkle = self._merkle_synchronizers.get(col)
         if merkle is None:
-            merkle = MerkleSynchronizer(codebase_path, self.ignore_patterns)
+            merkle = MerkleSynchronizer(codebase_path, self.ignore_patterns, merkle_dir=Path(self._cfg.data_dir) / "merkle")
             await merkle.initialize()
             self._merkle_synchronizers[col] = merkle
         merkle.save_current_state()
@@ -412,7 +416,7 @@ class Context:
             bm25_path.unlink()
         # Clear sync snapshots
         await FileSynchronizer.delete_snapshot(codebase_path)
-        await MerkleSynchronizer.delete_snapshot(codebase_path)
+        await MerkleSynchronizer.delete_snapshot(codebase_path, merkle_dir=Path(self._cfg.data_dir) / "merkle")
         self._merkle_synchronizers.pop(col, None)
         self._synchronizers.pop(col, None)
         logger.info("Cleared index for %s", codebase_path)
@@ -579,14 +583,14 @@ class Context:
 
         # --- Thread pool for parallel file reading + AST splitting ---
         from concurrent.futures import ThreadPoolExecutor
-        max_workers = min(os.cpu_count() or 4, 14)  # M4 Pro has 12-14 cores
+        max_workers = min(os.cpu_count() or 4, 24)  # I/O-bound: more workers = faster splitting
         executor = ThreadPoolExecutor(max_workers=max_workers)
         logger.info("Using %d workers for parallel file splitting (pipelined)", max_workers)
 
         # --- Async queue: decouples splitting (producer) from embedding (consumer) ---
         # Larger queue (8) allows more producer-consumer overlap so the
         # producer never stalls waiting for the consumer to embed.
-        queue: asyncio.Queue[list[CodeChunk] | None] = asyncio.Queue(maxsize=8)
+        queue: asyncio.Queue[list[CodeChunk] | None] = asyncio.Queue(maxsize=32)
 
         import time as _time
 
@@ -681,10 +685,12 @@ class Context:
                                    len(batch), exc)
                 state["embed_time"] += _time.monotonic() - t0
 
-                # Periodically save embedding cache (every 10 batches)
+                # Periodically save embedding cache (every 50 batches)
                 state["cache_save_counter"] += 1
-                if state["cache_save_counter"] % 10 == 0:
+                if state["cache_save_counter"] % 50 == 0:
                     self._embedding_cache.save()
+                    # Periodic FAISS persist — spread I/O, enable crash recovery
+                    self.vector_db.persist(col_name)
 
                 queue.task_done()
 
@@ -825,21 +831,17 @@ class Context:
         # Embed and insert uncached nodes (calls embedding API)
         if nodes:
             # Pre-compute embeddings so we can cache them AND pass to FAISS.
-            # Split into sub-batches and embed concurrently for higher GPU utilization
-            # (set OLLAMA_NUM_PARALLEL=4 on the Ollama server for best results).
+            # Use concurrent sub-batches to exploit OLLAMA_NUM_PARALLEL slots.
             embed_model = self.vector_db._embed_model
             try:
                 texts = [n.text for n in nodes]
-                # Adaptive sub-batching: match Ollama's OLLAMA_NUM_PARALLEL
-                # (default 4). Smaller sub-batches keep all model slots busy.
-                num_parallel = int(os.getenv("OLLAMA_NUM_PARALLEL", "4"))
-                sub_batch_size = max(10, len(texts) // num_parallel)
-                sub_batches = [
-                    texts[i:i + sub_batch_size]
-                    for i in range(0, len(texts), sub_batch_size)
-                ]
-
-                if len(sub_batches) > 1:
+                num_parallel = int(os.getenv("OLLAMA_NUM_PARALLEL", "1"))
+                if num_parallel > 1 and len(texts) > num_parallel:
+                    sub_batch_size = max(10, len(texts) // num_parallel)
+                    sub_batches = [
+                        texts[i:i + sub_batch_size]
+                        for i in range(0, len(texts), sub_batch_size)
+                    ]
                     from concurrent.futures import ThreadPoolExecutor as _TPE
                     with _TPE(max_workers=len(sub_batches)) as emb_pool:
                         emb_results = list(emb_pool.map(

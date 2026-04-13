@@ -2,6 +2,86 @@
 
 All notable changes to CodeContext are documented in this file.
 
+## [0.6.0] — 2026-04-13
+
+### Indexing Speed Optimizations + RAG Evaluation
+
+Major indexing speed improvements — **5.7x faster** (9 files/s → 51 files/s on 21K-file codebase).
+
+#### Added — Indexing Speed Optimizations
+
+- **Removed Ollama sub-batching** — sends all chunks in a single HTTP call per batch instead of splitting into 4 sub-batches. Saves ~400ms per batch × 2,100 batches = ~14 min on large codebases.
+- **Queue backpressure: 8 → 32** — more producer-consumer overlap, less idle time on either side.
+- **Thread pool: 14 → 24 workers** — file reading + AST parsing is I/O-bound; more workers keeps the pipeline fed.
+- **Cache save interval: 10 → 50 batches** — 5x fewer SQLite transactions during indexing.
+- **Periodic FAISS persist** — persists every 50 batches instead of only at the end, enabling crash recovery and smoother I/O.
+- **Configurable `embed_batch_size`** — Ollama embedding batch size now reads `EMBEDDING_BATCH_SIZE` env var (default 100).
+
+#### Added — RAG Evaluation
+
+- **`eval_rag.py`** — RAG accuracy evaluation script with 20 domain-specific queries (10 semantic, 5 keyword, 5 hybrid). Metrics: Hit Rate @K, MRR @K, Recall @K. Supports `--index-only`, `--skip-index`, `--top-k N` flags.
+- **Live progress** — shows files/s rate and ETA during indexing.
+
+#### Changed
+
+- **Chunk size: 1500 → 2500** — fewer chunks per file, fewer embedding API calls. Well within `nomic-embed-text` 8K token context.
+- **Chunk overlap: 200 → 250** — proportional increase with chunk size.
+
+## [0.5.0] — 2026-04-12
+
+### Package Restructure + Performance Optimizations + Index Reuse
+
+This release splits the package into `local/` and `remote/` modules, implements SimHash-based index reuse for teams, and adds major indexing performance optimizations.
+
+#### Package Structure
+
+Reorganized from `mcp/`, `server/`, `client/` into two clear packages:
+
+```
+codecontext/
+├── core/          # Shared search library (unchanged)
+├── local/         # Local MCP server (standalone single-developer mode)
+│   ├── server.py      # MCP tools — local indexing only
+│   ├── handlers.py    # background_indexing
+│   ├── snapshot.py    # SnapshotManager (V2 format, is_searchable at 80%)
+│   ├── sync.py        # SyncManager (5-min background re-index)
+│   └── utils.py       # CLI helpers
+└── remote/        # Remote server + proxy client (team mode)
+    ├── index_server.py   # HTTP API + SimHash registry + index reuse
+    ├── server.py         # MCP proxy (when INDEX_SERVER_URL is set)
+    ├── sync_client.py    # Upload client with SimHash registration
+    └── remote_search.py  # Search proxy
+```
+
+- `local/server.py` handles all local indexing — zero remote/SimHash logic
+- When `INDEX_SERVER_URL` is set, `local/server.py:main()` delegates to `remote/server.py`
+- Entry points updated: `codecontext` → `codecontext.local.server:main`, `codecontext-server` → `codecontext.remote.index_server:run_server`
+
+#### Added — SimHash Index Reuse (Architecture §4)
+
+- **SimHash computation** (`core/simhash.py`) — 128-bit locality-sensitive hash from file content hashes. Teammates on the same branch share ~92% similarity.
+- **SimHash registry** on the index server — persisted to `simhash_registry.json`. New endpoints: `POST /api/register-simhash`, `POST /api/find-similar`.
+- **Automatic index reuse** — when a new workspace is indexed, the server finds the most similar existing index (≥85% threshold), copies FAISS + BM25 files, then runs incremental indexing only on differing files. Cursor's data: median 7.87s → 525ms.
+- **SyncClient SimHash registration** — after uploading files, the client registers its SimHash so future teammates benefit from the index.
+- **`copy_collection()`** on `FaissVectorDB` — copies FAISS files + metadata on disk for team reuse.
+
+#### Added — Performance Optimizations
+
+- **Embedding cache: JSON → SQLite** — WAL mode, 3-tier lookup (pending → in-memory read-through → SQLite), `get_batch()` bulk queries (batches of 900 for bind param limit). Startup: instant vs 30+ seconds for 1.2 GB JSON. Auto-migrates from legacy JSON.
+- **BM25: JSON → pickle** — 5-10x faster serialization for 900 MB+ indices. Auto-migrates from legacy JSON.
+- **Parallel Merkle tree hashing** — `ThreadPoolExecutor` (up to 16 workers) for repos with 100+ files. Serial for small repos to avoid pool overhead.
+- **Pre-compiled ignore patterns** — fnmatch patterns compiled into a single regex for fast matching during file walks.
+- **Early search at 80%** — `SnapshotManager.is_searchable()` returns true when indexing is ≥80% complete.
+- **Queue backpressure tuning** — `asyncio.Queue` maxsize increased 4 → 8 to keep the pipeline fed.
+- **Adaptive embedding sub-batching** — reads `OLLAMA_NUM_PARALLEL` env var to match sub-batch count to server capacity.
+
+#### Changed
+
+- **Entry points** — `codecontext` → `codecontext.local.server:main`, `codecontext-server` → `codecontext.remote.index_server:run_server`
+- **`_flush_buffer()` refactored** — Phase 1 builds all TextNodes and collects hashes, Phase 2 does bulk cache lookup via `get_batch()`, then splits into cached vs needs-embedding. Eliminates per-chunk SQL overhead.
+
+---
+
 ## [0.4.0] — 2026-04-08
 
 ### Remote Indexing

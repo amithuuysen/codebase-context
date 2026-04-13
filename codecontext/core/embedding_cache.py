@@ -63,7 +63,14 @@ class EmbeddingCache:
 
     def _init_db(self) -> None:
         """Open (or create) the SQLite database and migrate from JSON if needed."""
-        self._conn = sqlite3.connect(str(self._db_path), timeout=10)
+        # check_same_thread=False is safe here: the asyncio consumer loop is
+        # single-threaded, and producer threads never touch the connection.
+        # Without this, the producer/consumer pipeline fails when the
+        # connection is created on the main thread but used from the async
+        # event loop thread.
+        self._conn = sqlite3.connect(
+            str(self._db_path), timeout=10, check_same_thread=False
+        )
         self._conn.execute("PRAGMA journal_mode=WAL")  # faster concurrent reads
         self._conn.execute("PRAGMA synchronous=NORMAL")  # safe + fast
         self._conn.execute(

@@ -91,8 +91,10 @@ class Config:
     ollama_host: str = "http://127.0.0.1:11434"
     ollama_model: str = "nomic-embed-text"
     local_model: str = "all-MiniLM-L6-v2"
-    chunk_size: int = 3000
-    chunk_overlap: int = 300
+    fastembed_model: str = "BAAI/bge-small-en-v1.5"
+    llamacpp_model_path: str = ""
+    chunk_size: int = 2500
+    chunk_overlap: int = 250
     embedding_batch_size: int = 100
     chunk_limit: int = 450_000
     sync_interval_seconds: int = 300
@@ -108,13 +110,16 @@ class Config:
             ollama_host=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"),
             ollama_model=os.getenv("OLLAMA_MODEL", "nomic-embed-text"),
             local_model=os.getenv("LOCAL_EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
-            chunk_size=int(os.getenv("CHUNK_SIZE", "1500")),
-            chunk_overlap=int(os.getenv("CHUNK_OVERLAP", "200")),
+            fastembed_model=os.getenv("FASTEMBED_MODEL", "BAAI/bge-small-en-v1.5"),
+            llamacpp_model_path=os.getenv("LLAMACPP_MODEL_PATH", ""),
+            chunk_size=int(os.getenv("CHUNK_SIZE", "2500")),
+            chunk_overlap=int(os.getenv("CHUNK_OVERLAP", "250")),
             embedding_batch_size=int(os.getenv("EMBEDDING_BATCH_SIZE", "100")),
             chunk_limit=int(os.getenv("CHUNK_LIMIT", "450000")),
             sync_interval_seconds=int(os.getenv("SYNC_INTERVAL_SECONDS", "300")),
             data_dir=os.getenv("CODECONTEXT_DATA_DIR", str(CONTEXT_DIR)),
         )
+        # Auto-select model per provider
         if not cfg.embedding_model:
             if cfg.embedding_provider == "openai":
                 cfg.embedding_model = "text-embedding-3-small"
@@ -122,4 +127,13 @@ class Config:
                 cfg.embedding_model = cfg.ollama_model
             elif cfg.embedding_provider == "local":
                 cfg.embedding_model = cfg.local_model
+            elif cfg.embedding_provider == "fastembed":
+                cfg.embedding_model = cfg.fastembed_model
+            elif cfg.embedding_provider == "llamacpp":
+                cfg.embedding_model = cfg.llamacpp_model_path or "llamacpp"
+        # Per-provider/model index directory — prevents dimension conflicts
+        # e.g. ~/.context/ollama_nomic-embed-text/ vs ~/.context/local_all-MiniLM-L6-v2/
+        if not os.getenv("CODECONTEXT_DATA_DIR"):
+            safe_model = cfg.embedding_model.replace("/", "_").replace(":", "_").replace("\\", "_")
+            cfg.data_dir = str(Path(cfg.data_dir) / f"{cfg.embedding_provider}_{safe_model}")
         return cfg

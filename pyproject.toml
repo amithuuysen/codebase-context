@@ -30,6 +30,20 @@ dependencies = [
 codecontext = "codecontext.local.server:main"
 codecontext-server = "codecontext.remote.index_server:run_server"
 
+[project.optional-dependencies]
+fastembed = [
+    "llama-index-embeddings-fastembed>=0.2.0",
+    "fastembed>=0.3.0",
+]
+llamacpp = [
+    "llama-cpp-python>=0.2.0",
+]
+all = [
+    "llama-index-embeddings-fastembed>=0.2.0",
+    "fastembed>=0.3.0",
+    "llama-cpp-python>=0.2.0",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
