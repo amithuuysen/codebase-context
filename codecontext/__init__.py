@@ -1,3 +1,9 @@
+import os as _os
+
+# Prevent "OMP: Error #15" on macOS where faiss-cpu and PyTorch each ship
+# their own copy of libomp.  Must be set before either library is imported.
+_os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 """
 codecontext — Semantic code search via MCP protocol.
 
