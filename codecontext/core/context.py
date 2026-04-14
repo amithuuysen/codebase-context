@@ -831,11 +831,14 @@ class Context:
         # Embed and insert uncached nodes (calls embedding API)
         if nodes:
             # Pre-compute embeddings so we can cache them AND pass to FAISS.
-            # Use concurrent sub-batches to exploit OLLAMA_NUM_PARALLEL slots.
+            # Use concurrent sub-batches to exploit parallelism for any provider.
             embed_model = self.vector_db._embed_model
             try:
                 texts = [n.text for n in nodes]
-                num_parallel = int(os.getenv("OLLAMA_NUM_PARALLEL", "1"))
+                num_parallel = int(
+                    os.getenv("EMBEDDING_NUM_PARALLEL")
+                    or os.getenv("OLLAMA_NUM_PARALLEL", "1")
+                )
                 if num_parallel > 1 and len(texts) > num_parallel:
                     sub_batch_size = max(10, len(texts) // num_parallel)
                     sub_batches = [

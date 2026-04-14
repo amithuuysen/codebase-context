@@ -189,11 +189,13 @@ def create_embedding(provider: str, **kwargs) -> BaseEmbedding:
             )
 
         model = kwargs.get("model", "BAAI/bge-small-en-v1.5")
+        threads = int(os.getenv("FASTEMBED_THREADS", "0")) or os.cpu_count() or 4
         embed_model = FastEmbedEmbedding(
             model_name=model,
             embed_batch_size=batch_size,
+            threads=threads,
         )
-        logger.info("Embedding: FastEmbed (ONNX) model=%s", model)
+        logger.info("Embedding: FastEmbed (ONNX) model=%s threads=%d", model, threads)
         return embed_model
 
     elif provider == "llamacpp":
